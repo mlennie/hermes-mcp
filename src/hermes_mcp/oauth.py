@@ -31,7 +31,9 @@ Dynamic Client Registration is intentionally disabled. Anyone hitting
 Concurrency: hermes-mcp is single-process and the dict mutations below are
 guarded by Python's GIL on the basic operations we use (dict set/get/pop).
 We do not need an explicit lock for single-user traffic. Disk writes are
-low-frequency (one write per token mint/rotation) and similarly GIL-safe.
+low-frequency (one per token mint/rotation); the real reason no lock is
+needed is the single-user, single-process deployment model — not GIL
+atomicity across the multi-step serialize-then-replace sequence.
 """
 
 from __future__ import annotations
@@ -179,6 +181,10 @@ class TokenStore:
         """Serialize current token state to disk."""
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(self._path.parent, 0o700)
+            except OSError:
+                pass
             data = {
                 "access_tokens": {
                     k: v.model_dump() for k, v in access_tokens.items()
@@ -196,10 +202,20 @@ class TokenStore:
                 os.chmod(tmp_path, 0o600)
                 with os.fdopen(fd, "w") as f:
                     json.dump(data, f)
+                    f.flush()
+                    os.fsync(f.fileno())
                 os.replace(tmp_path, self._path)
                 # Ensure final file also has mode 0o600 (os.replace preserves
                 # destination permissions on some platforms; set explicitly).
                 os.chmod(self._path, 0o600)
+                # Fsync the parent directory so the rename is durable on-disk.
+                parent_fd = os.open(str(self._path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(parent_fd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(parent_fd)
             except Exception:
                 # Clean up temp file on failure.
                 try:
@@ -228,12 +244,18 @@ class TokenStore:
             logger.warning("token-store: failed to read tokens file: %s", exc)
             return {}, {}, {}
 
+        if not isinstance(data, dict):
+            logger.warning("token-store: unexpected shape in tokens file (got %s), discarding", type(data).__name__)
+            return {}, {}, {}
+
         now = int(time.time())
         access_tokens: dict[str, AccessToken] = {}
         refresh_tokens: dict[str, RefreshToken] = {}
-        refresh_to_access: dict[str, str] = dict(data.get("refresh_to_access") or {})
+        raw_r2a = data.get("refresh_to_access")
+        refresh_to_access: dict[str, str] = dict(raw_r2a) if isinstance(raw_r2a, dict) else {}
 
-        for key, val in (data.get("access_tokens") or {}).items():
+        raw_at = data.get("access_tokens")
+        for key, val in (raw_at.items() if isinstance(raw_at, dict) else []):
             try:
                 at = AccessToken.model_validate(val)
                 if at.expires_at is None or at.expires_at > now:
@@ -241,7 +263,8 @@ class TokenStore:
             except Exception as exc:
                 logger.debug("token-store: skipping invalid access token entry: %s", exc)
 
-        for key, val in (data.get("refresh_tokens") or {}).items():
+        raw_rt = data.get("refresh_tokens")
+        for key, val in (raw_rt.items() if isinstance(raw_rt, dict) else []):
             try:
                 rt = RefreshToken.model_validate(val)
                 if rt.expires_at is None or rt.expires_at > now:
@@ -252,9 +275,12 @@ class TokenStore:
             except Exception as exc:
                 logger.debug("token-store: skipping invalid refresh token entry: %s", exc)
 
-        # Remove refresh_to_access entries whose refresh token didn't survive.
+        # Remove refresh_to_access entries where either the refresh token or the
+        # mapped access token did not survive expiry filtering.
         refresh_to_access = {
-            k: v for k, v in refresh_to_access.items() if k in refresh_tokens
+            k: v
+            for k, v in refresh_to_access.items()
+            if k in refresh_tokens and v in access_tokens
         }
 
         loaded = len(access_tokens) + len(refresh_tokens)
@@ -267,7 +293,7 @@ class TokenStore:
 class StaticClientProvider(
     OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
 ):
-    """In-memory OAuth provider for a single pre-shared client.
+    """In-memory + disk-persisted OAuth provider for a single pre-shared client.
 
     Tokens are persisted to disk (token_store_path) and reloaded on startup
     so that restarts do not require the MCP client to re-authenticate.
@@ -431,6 +457,10 @@ class StaticClientProvider(
             self._access_tokens.pop(old_access, None)
         result = self._mint_token_pair(client, scopes or refresh_token.scopes, None)
         # _mint_token_pair already saves; nothing extra needed here.
+        # Limitation: if the save inside _mint_token_pair fails, a later restart
+        # will reload the pre-rotation state from disk (old tokens gone in memory,
+        # new tokens not on disk). The client will need to re-authenticate.
+        # Accepted for the single-user, best-effort-persistence threat model.
         return result
 
     async def load_access_token(self, token: str) -> AccessToken | None:
@@ -470,6 +500,8 @@ class StaticClientProvider(
             old_access = self._refresh_to_access.pop(token.token, None)
             if old_access:
                 self._access_tokens.pop(old_access, None)
+        # Persist so revoked tokens don't reappear after a restart.
+        self._save_tokens()
 
     def _reap_expired_codes(self) -> None:
         now = time.time()
