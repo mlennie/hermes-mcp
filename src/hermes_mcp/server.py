@@ -260,6 +260,7 @@ def build_app(
         client_secret=config.oauth_client_secret,
         bearer_token=config.mcp_bearer_token,
         allowed_redirect_schemes=frozenset(config.allowed_redirect_schemes),
+        token_store_path=config.token_store_path,
     )
 
     issuer_url = AnyHttpUrl(config.oauth_issuer_url)

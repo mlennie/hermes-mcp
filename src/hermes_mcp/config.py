@@ -11,9 +11,11 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from hermes_mcp.oauth import DEFAULT_ALLOWED_REDIRECT_SCHEMES as _DEFAULT_SCHEMES
+from hermes_mcp.oauth import DEFAULT_TOKEN_STORE_PATH as _DEFAULT_TOKEN_STORE_PATH
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 _VALID_LOG_LEVELS: frozenset[str] = frozenset(("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
@@ -50,6 +52,9 @@ class Config:
     # config) and have no OAuth flow.
     mcp_bearer_token: str | None
     log_level: LogLevel
+    # Path to the token persistence file. Defaults to
+    # ~/.config/hermes-mcp/tokens.json. Configurable via TOKEN_STORE_PATH.
+    token_store_path: Path
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -161,6 +166,13 @@ class Config:
                 bind_host,
             )
 
+        token_store_path_raw = (e.get("TOKEN_STORE_PATH") or "").strip()
+        token_store_path = (
+            Path(token_store_path_raw).expanduser()
+            if token_store_path_raw
+            else _DEFAULT_TOKEN_STORE_PATH
+        )
+
         return cls(
             oauth_client_id=client_id,
             oauth_client_secret=client_secret,
@@ -175,6 +187,7 @@ class Config:
             allowed_redirect_schemes=allowed_redirect_schemes,
             mcp_bearer_token=mcp_bearer_token,
             log_level=log_level,
+            token_store_path=token_store_path,
         )
 
 

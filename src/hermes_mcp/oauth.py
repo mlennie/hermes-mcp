@@ -14,8 +14,9 @@ provider:
     is rejected with `invalid_grant`, so the dynamic per-exchange
     `code_verifier` is what actually protects token issuance.
   - auto-approves the /authorize step
-  - mints opaque random access and refresh tokens, stored in memory
-  - has no persistence: tokens evaporate on restart, the client just re-auths
+  - mints opaque random access and refresh tokens, stored in memory and
+    persisted to disk so they survive process restarts
+  - reloads non-expired tokens from disk on startup
 
 `OAUTH_CLIENT_SECRET` is still required at startup for backward
 compatibility (Claude Desktop / Claude.ai have it pasted in their connector
@@ -29,16 +30,21 @@ Dynamic Client Registration is intentionally disabled. Anyone hitting
 
 Concurrency: hermes-mcp is single-process and the dict mutations below are
 guarded by Python's GIL on the basic operations we use (dict set/get/pop).
-We do not need an explicit lock for single-user traffic.
+We do not need an explicit lock for single-user traffic. Disk writes are
+low-frequency (one write per token mint/rotation) and similarly GIL-safe.
 """
 
 from __future__ import annotations
 
 import hmac
+import json
 import logging
+import os
 import secrets
+import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -80,6 +86,10 @@ _BASELINE_SCHEMES: frozenset[str] = frozenset({"https", "http"})
 # clients (e.g. `vscode` for Continue). Re-exported from `config.py` so the
 # server default and the env-var default cannot drift apart.
 DEFAULT_ALLOWED_REDIRECT_SCHEMES: frozenset[str] = frozenset({"claude", "claudeai", "cursor"})
+
+# Default path for the token store. Re-exported so config.py can reference it
+# without duplicating the default.
+DEFAULT_TOKEN_STORE_PATH: Path = Path.home() / ".config" / "hermes-mcp" / "tokens.json"
 
 
 def _check_redirect_uri(redirect_uri: AnyUrl, allowed_schemes: frozenset[str]) -> None:
@@ -146,11 +156,121 @@ class _StaticClient(OAuthClientInformationFull):
         return redirect_uri
 
 
+class TokenStore:
+    """Handles persistence of OAuth tokens to/from disk.
+
+    Tokens are written atomically (temp file + os.replace) to prevent
+    corrupt state on crash mid-write. The file is created with mode 0o600
+    so only the owning user can read it.
+
+    Auth codes are intentionally excluded: their 60-second TTL makes
+    persistence useless (they'd always be expired on reload).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def save(
+        self,
+        access_tokens: dict[str, AccessToken],
+        refresh_tokens: dict[str, RefreshToken],
+        refresh_to_access: dict[str, str],
+    ) -> None:
+        """Serialize current token state to disk."""
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "access_tokens": {
+                    k: v.model_dump() for k, v in access_tokens.items()
+                },
+                "refresh_tokens": {
+                    k: v.model_dump() for k, v in refresh_tokens.items()
+                },
+                "refresh_to_access": dict(refresh_to_access),
+            }
+            # Atomic write: temp file in same directory, then os.replace.
+            fd, tmp_path = tempfile.mkstemp(
+                dir=self._path.parent, prefix=".tokens.", suffix=".tmp"
+            )
+            try:
+                os.chmod(tmp_path, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp_path, self._path)
+                # Ensure final file also has mode 0o600 (os.replace preserves
+                # destination permissions on some platforms; set explicitly).
+                os.chmod(self._path, 0o600)
+            except Exception:
+                # Clean up temp file on failure.
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:
+            logger.warning("token-store: failed to save tokens: %s", exc)
+
+    def load(
+        self,
+    ) -> tuple[dict[str, AccessToken], dict[str, RefreshToken], dict[str, str]]:
+        """Load and return non-expired tokens from disk.
+
+        Returns three dicts: access_tokens, refresh_tokens, refresh_to_access.
+        Any token whose `expires_at` is in the past is silently dropped.
+        Returns empty dicts if the file does not exist or cannot be parsed.
+        """
+        if not self._path.exists():
+            return {}, {}, {}
+        try:
+            with self._path.open() as f:
+                data = json.load(f)
+        except Exception as exc:
+            logger.warning("token-store: failed to read tokens file: %s", exc)
+            return {}, {}, {}
+
+        now = int(time.time())
+        access_tokens: dict[str, AccessToken] = {}
+        refresh_tokens: dict[str, RefreshToken] = {}
+        refresh_to_access: dict[str, str] = dict(data.get("refresh_to_access") or {})
+
+        for key, val in (data.get("access_tokens") or {}).items():
+            try:
+                at = AccessToken.model_validate(val)
+                if at.expires_at is None or at.expires_at > now:
+                    access_tokens[key] = at
+            except Exception as exc:
+                logger.debug("token-store: skipping invalid access token entry: %s", exc)
+
+        for key, val in (data.get("refresh_tokens") or {}).items():
+            try:
+                rt = RefreshToken.model_validate(val)
+                if rt.expires_at is None or rt.expires_at > now:
+                    refresh_tokens[key] = rt
+                else:
+                    # Also drop the corresponding refresh_to_access mapping.
+                    refresh_to_access.pop(key, None)
+            except Exception as exc:
+                logger.debug("token-store: skipping invalid refresh token entry: %s", exc)
+
+        # Remove refresh_to_access entries whose refresh token didn't survive.
+        refresh_to_access = {
+            k: v for k, v in refresh_to_access.items() if k in refresh_tokens
+        }
+
+        loaded = len(access_tokens) + len(refresh_tokens)
+        if loaded:
+            logger.info("token-store: loaded %d token(s) from %s", loaded, self._path)
+        return access_tokens, refresh_tokens, refresh_to_access
+
+
 @dataclass
 class StaticClientProvider(
     OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
 ):
     """In-memory OAuth provider for a single pre-shared client.
+
+    Tokens are persisted to disk (token_store_path) and reloaded on startup
+    so that restarts do not require the MCP client to re-authenticate.
 
     Optionally also accepts a static `bearer_token` as an alternative auth
     method, for MCP clients (Codex desktop's custom-MCP form, Cursor's
@@ -166,6 +286,7 @@ class StaticClientProvider(
     allowed_redirect_schemes: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_SCHEMES
     access_token_ttl: int = DEFAULT_ACCESS_TOKEN_TTL
     refresh_token_ttl: int = DEFAULT_REFRESH_TOKEN_TTL
+    token_store_path: Path = field(default_factory=lambda: DEFAULT_TOKEN_STORE_PATH)
 
     def __post_init__(self) -> None:
         # `self.client_secret` is kept required at construction time for
@@ -207,6 +328,21 @@ class StaticClientProvider(
         # One-time audit log marker so the first bearer-auth event surfaces
         # at INFO without spamming every subsequent request.
         self._bearer_logged: bool = False
+
+        # Load persisted tokens from disk.
+        self._token_store = TokenStore(Path(self.token_store_path))
+        at, rt, r2a = self._token_store.load()
+        self._access_tokens.update(at)
+        self._refresh_tokens.update(rt)
+        self._refresh_to_access.update(r2a)
+
+    def _save_tokens(self) -> None:
+        """Persist current token state to disk."""
+        self._token_store.save(
+            self._access_tokens,
+            self._refresh_tokens,
+            self._refresh_to_access,
+        )
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         if hmac.compare_digest(client_id.encode(), self.client_id.encode()):
@@ -293,7 +429,9 @@ class StaticClientProvider(
         old_access = self._refresh_to_access.pop(refresh_token.token, None)
         if old_access:
             self._access_tokens.pop(old_access, None)
-        return self._mint_token_pair(client, scopes or refresh_token.scopes, None)
+        result = self._mint_token_pair(client, scopes or refresh_token.scopes, None)
+        # _mint_token_pair already saves; nothing extra needed here.
+        return result
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         # Static bearer-token path: for clients with no OAuth UI. Compared
@@ -374,6 +512,8 @@ class StaticClientProvider(
         )
         self._refresh_to_access[refresh] = access
         logger.info("oauth: minted token pair (expires_in=%ds)", self.access_token_ttl)
+        # Persist after every mint so tokens survive an immediate restart.
+        self._save_tokens()
         return OAuthToken(
             access_token=access,
             token_type="Bearer",  # noqa: S106 — OAuth token-type literal, not a secret
@@ -389,6 +529,9 @@ class StaticClientProvider(
         ]
         for t in expired:
             self._access_tokens.pop(t, None)
+        # Persist after reaping so the disk copy doesn't grow stale entries.
+        if expired:
+            self._save_tokens()
 
 
 def mint_client_credentials() -> tuple[str, str]:
