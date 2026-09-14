@@ -4,6 +4,11 @@
 
 Use Claude (or another supported MCP client) as your daily chat. When you ask for something Hermes is built for — scheduling cron jobs, browser automation, email, document creation, persistent skills, WhatsApp/Slack messaging — your client calls Hermes through this bridge.
 
+> **Do not write code?** Start with the
+> [plain-language setup and verification guide](docs/non-coder-start-here.md). It explains
+> what each component does, the shortest Hostinger-and-Town path, how to test it safely,
+> and what common errors mean.
+
 ```
 ┌──────────────────────────────────────────────────────┐
 │ MCP client                                           │
@@ -102,6 +107,7 @@ Pick whichever the client's UI supports — both auth paths coexist on the same 
 | **Claude Desktop / Claude.ai (web + mobile)** | OAuth | Settings → Connectors → Add custom connector → paste the server URL + your `OAUTH_CLIENT_ID` + your `OAUTH_CLIENT_SECRET`. (The secret is accepted but no longer enforced server-side; the field is still required by Claude's UI, so set it.) |
 | **OpenAI Codex desktop** | Bearer | Settings → MCP → Connect to a custom MCP → Streamable HTTP → URL = your tunnel + `/mcp`, **Bearer token env var** = name of an OS env var on your laptop that holds your `MCP_BEARER_TOKEN` value. Restart Codex desktop after setting the env var so it's inherited. Skips OAuth entirely. |
 | **Cursor** | Bearer | Settings → MCP → Add custom MCP → paste the JSON below into `~/.cursor/mcp.json`. No OAuth flow, no extra config. |
+| **Town** | OAuth | Settings → MCP → Add Server → URL = your public bridge URL + `/mcp` → complete OAuth. Enable the server only for the routines that need it. See the [Town + Hostinger guide](docs/town-hostinger.md). |
 
 #### Cursor — exact `~/.cursor/mcp.json` snippet
 
@@ -164,10 +170,16 @@ Most MCP clients enforce a per-tool-call timeout: Claude.ai / Claude Desktop is 
 
 ```jsonc
 // hermes_ask(prompt="...", async_mode=true) returns immediately:
-{"job_id": "8a3f...e21", "status": "pending"}
+{"job_id": "8a3f...e21", "status": "pending", "completion_scope": "gateway_response"}
 ```
 
-Then poll `hermes_check(job_id)` until `status` is `completed`, `failed`, or `cancelled`. Hermes keeps running in the background regardless of whether you poll. Jobs are stored in-memory for ~24 hours and lost on a server restart.
+Then poll `hermes_check(job_id)` until `status` is `completed`, `failed`, or `cancelled`. Hermes keeps running in the background regardless of whether you poll. Job results are stored in SQLite and survive a server restart for ~24 hours after reaching a terminal state. Interrupted requests retain an explicit unconfirmed outcome; they are never automatically replayed.
+
+Every async response includes `completion_scope: "gateway_response"`. A `completed` job
+means the Hermes gateway returned a response. If that response is a receipt for work
+delegated to a separate worker, queue, CI run, or deployment, query that downstream state
+before telling the user the work is complete. Reuse the same `session_id` for that status
+request; do not resubmit the original instruction merely because the bridge job ended.
 
 **When to use async** — the calling LLM reads heuristics from the tool description and should pick the right mode on its own, but the rules of thumb are:
 
@@ -190,14 +202,14 @@ If you want to force the choice, just say so in your prompt: *"use `async_mode=t
 Returns a JSON string with the current status of an async job:
 
 ```jsonc
-{"job_id": "8a3f...e21", "status": "completed", "created_at": 1747...,
+{"job_id": "8a3f...e21", "status": "completed", "completion_scope": "gateway_response", "created_at": 1747...,
  "finished_at": 1747..., "prompt_chars": 12303, "session_id": "...",
  "result": "..."}
-{"job_id": "8a3f...e21", "status": "failed",    "error":  "...", ...}
-{"job_id": "8a3f...e21", "status": "cancelled", ...}
-{"job_id": "8a3f...e21", "status": "running",   ...}
-{"job_id": "8a3f...e21", "status": "pending",   ...}
-{"job_id": "<your-input>", "status": "unknown"} // never issued by this server, reaped after 24h, or wiped by hermes_reset
+{"job_id": "8a3f...e21", "status": "failed",    "completion_scope": "gateway_response", "error":  "...", ...}
+{"job_id": "8a3f...e21", "status": "cancelled", "completion_scope": "gateway_response", ...}
+{"job_id": "8a3f...e21", "status": "running",   "completion_scope": "gateway_response", ...}
+{"job_id": "8a3f...e21", "status": "pending",   "completion_scope": "gateway_response", ...}
+{"job_id": "<your-input>", "status": "unknown", "completion_scope": "gateway_response"} // never issued by this server, reaped after 24h, or wiped by hermes_reset
 ```
 
 `created_at` and `finished_at` are epoch seconds — the calling LLM can subtract them to show "running for N minutes" in chat.
@@ -214,7 +226,7 @@ Returns the same JSON shape as `hermes_check`. Cancelling an already-terminal jo
 
 ### `hermes_reset()`
 
-Wipes every job from the in-memory store in a single call. Use this to recover from a cluttered or stuck queue without restarting the server process. After it returns, every prior `job_id` becomes `unknown` on `hermes_check` and `hermes_cancel`.
+Wipes every job from the durable store in a single call. Use this to recover from a cluttered or stuck queue without restarting the server process. After it returns, every prior `job_id` becomes `unknown` on `hermes_check` and `hermes_cancel`.
 
 ```jsonc
 // hermes_reset() returns:
@@ -231,6 +243,15 @@ Expired terminal jobs (older than the 24h TTL) are reaped lazily before counting
 ## Network exposure: `cloudflared`
 
 Recommended. Free, open-source, no bandwidth cap that matters at personal scale.
+
+If Hermes Agent already runs under Docker behind Traefik, including Hostinger's Docker
+Manager, use the [Town + Hostinger Docker/Traefik guide](docs/town-hostinger.md). It includes
+a container image, two Compose patterns, public-route checks, durable-session guidance, and the
+router-label placement that prevents a healthy deployment from returning `502`.
+
+Town users can also adapt the
+[durable Hermes Project Lead routine template](docs/town-routine-template.md) as a guarded,
+single-session front desk for a project.
 
 There are two flavors. Use the **quick tunnel** to test today; use the **named tunnel** for any setup you want to leave running.
 
@@ -361,6 +382,8 @@ Restart after editing the env file: `systemctl --user restart hermes-mcp`.
 | Tunnel URL | Stable (named tunnel). ✅ |
 | OAuth `client_id` / `client_secret` | Read from `~/.config/hermes-mcp/env` at startup. ✅ |
 | `MCP_BEARER_TOKEN` (if set) | Read from `~/.config/hermes-mcp/env` at startup. ✅ |
+| Completed async-job results | Persist on disk for ~24 hours after completion; Docker needs the supplied named volume. ✅ |
+| Interrupted async jobs | Retained as failed with an **unconfirmed outcome**; never automatically resubmitted. |
 | Live OAuth access / refresh tokens | **Stored in memory only — lost on every restart.** ❌ |
 
 **Practical impact:** the host can reboot freely; the bridge comes back up on the same URL. But Claude Desktop is holding access and refresh tokens that are now invalid (the in-memory store they were minted from is gone). On the next call, Claude usually reports `"Error occurred during tool execution"` rather than transparently re-running OAuth.
@@ -372,6 +395,29 @@ Restart after editing the env file: `systemctl --user restart hermes-mcp`.
 Claude does the OAuth flow against the bridge using the saved `client_id` / `client_secret` and you're back online. Same goes for any time you `systemctl --user restart hermes-mcp` (e.g. after editing the env file or upgrading the package).
 
 This is a known limitation of the in-memory token store. Persisting tokens to disk is on the roadmap.
+
+## Responsiveness, durable jobs, and upgrades
+
+Waiting for a Hermes response now yields to the MCP event loop. Status checks can
+continue during a long request. Short SQLite operations use an explicitly sized
+executor (`HERMES_MCP_EXECUTOR_WORKERS`, default 16, valid range 1–128).
+The server remains a single worker; do not add Uvicorn workers against the same
+job store. A process-owner lock rejects that configuration.
+
+`HERMES_MCP_JOB_STORE_PATH` selects the SQLite file. The local default is
+`~/.local/state/hermes-mcp/jobs.sqlite3`. Docker examples mount a named volume at
+`/var/lib/hermes-mcp`; the systemd example uses the writable
+`~/.config/hermes-mcp` directory. Keep the database, WAL, and lock files together
+on persistent local storage with a private parent directory.
+
+**Existing installation? Follow [the upgrade guide](docs/upgrading.md).** It covers
+preserving existing deployment settings, adding the volume, checking a completed
+job after restart, and reconnecting OAuth if needed. Results already lost by an
+older in-memory bridge cannot be recovered by upgrading.
+
+Job completion still means **the gateway returned an answer**, not that every
+worker or deployment mentioned in that answer finished. The Town
+`completion_scope: gateway_response` field remains intact.
 
 ## Security
 

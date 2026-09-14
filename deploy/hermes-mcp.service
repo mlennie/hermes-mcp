@@ -9,6 +9,7 @@ Type=simple
 # Install as a systemd --user unit at ~/.config/systemd/user/hermes-mcp.service
 # Env file (mode 0600) must contain OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET,
 # OAUTH_ISSUER_URL, MCP_ALLOWED_HOSTS, HERMES_API_KEY — see .env.example
+Environment=HERMES_MCP_JOB_STORE_PATH=%h/.config/hermes-mcp/jobs.sqlite3
 EnvironmentFile=%h/.config/hermes-mcp/env
 ExecStart=%h/.local/bin/hermes-mcp serve
 Restart=on-failure

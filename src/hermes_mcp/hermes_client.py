@@ -61,8 +61,47 @@ class HermesClient:
         selection now lives in Hermes config (`platform_toolsets.api_server`).
         """
         del toolsets
+        body, headers = self._request(prompt, session_id)
 
-        body = {
+        try:
+            response = httpx.post(
+                self._endpoint,
+                json=body,
+                headers=headers,
+                timeout=self._timeout,
+                follow_redirects=False,
+            )
+        except httpx.TimeoutException as exc:
+            raise HermesError(f"hermes gateway timed out after {self._timeout}s") from exc
+        except httpx.HTTPError as exc:
+            raise HermesError(f"hermes gateway request failed: {exc}") from exc
+
+        return self._response_text(response)
+
+    async def ask_async(
+        self,
+        prompt: str,
+        session_id: str | None = None,
+        toolsets: list[str] | None = None,
+    ) -> str:
+        """Wait for a gateway answer without blocking the MCP event loop."""
+        del toolsets
+        body, headers = self._request(prompt, session_id)
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout, follow_redirects=False) as client:
+                response = await client.post(self._endpoint, json=body, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise HermesError(f"hermes gateway timed out after {self._timeout}s") from exc
+        except httpx.HTTPError as exc:
+            raise HermesError(f"hermes gateway request failed: {exc}") from exc
+        return self._response_text(response)
+
+    def _request(
+        self,
+        prompt: str,
+        session_id: str | None,
+    ) -> tuple[dict[str, object], dict[str, str]]:
+        body: dict[str, object] = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
@@ -84,19 +123,9 @@ class HermesClient:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("hermes request body: %s", body)
 
-        try:
-            response = httpx.post(
-                self._endpoint,
-                json=body,
-                headers=headers,
-                timeout=self._timeout,
-                follow_redirects=False,
-            )
-        except httpx.TimeoutException as exc:
-            raise HermesError(f"hermes gateway timed out after {self._timeout}s") from exc
-        except httpx.HTTPError as exc:
-            raise HermesError(f"hermes gateway request failed: {exc}") from exc
+        return body, headers
 
+    def _response_text(self, response: httpx.Response) -> str:
         if response.status_code == 401:
             raise HermesError(
                 "hermes gateway rejected the API key (401). "

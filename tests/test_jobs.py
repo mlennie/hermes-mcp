@@ -275,6 +275,7 @@ def test_to_dict_always_includes_required_fields() -> None:
     assert d == {
         "job_id": "abc",
         "status": "pending",
+        "completion_scope": "gateway_response",
         "created_at": 1234.5,
         "prompt_chars": 0,
     }

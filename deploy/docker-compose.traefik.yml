@@ -1,0 +1,41 @@
+services:
+  hermes-mcp:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    volumes:
+      - hermes-mcp-jobs:/var/lib/hermes-mcp
+    env_file:
+      - ${HERMES_MCP_ENV_FILE:-./hermes-mcp.env}
+    environment:
+      BIND_HOST: 0.0.0.0
+      BIND_PORT: 8765
+      HERMES_MCP_JOB_STORE_PATH: /var/lib/hermes-mcp/jobs.sqlite3
+      HERMES_API_URL: ${HERMES_API_URL:-http://hermes-agent:8642}
+      MCP_ALLOWED_HOSTS: ${MCP_HOSTNAME:?set MCP_HOSTNAME}
+      OAUTH_ISSUER_URL: https://${MCP_HOSTNAME:?set MCP_HOSTNAME}
+    expose:
+      - "8765"
+    networks:
+      - hermes
+      - edge
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${TRAEFIK_NETWORK:?set TRAEFIK_NETWORK}
+      traefik.http.routers.hermes-mcp.entrypoints: websecure
+      traefik.http.routers.hermes-mcp.rule: Host(`${MCP_HOSTNAME:?set MCP_HOSTNAME}`)
+      traefik.http.routers.hermes-mcp.tls: "true"
+      traefik.http.routers.hermes-mcp.tls.certresolver: ${TRAEFIK_CERT_RESOLVER:?set TRAEFIK_CERT_RESOLVER}
+      traefik.http.services.hermes-mcp.loadbalancer.server.port: "8765"
+
+networks:
+  hermes:
+    external: true
+    name: ${HERMES_NETWORK:?set HERMES_NETWORK}
+  edge:
+    external: true
+    name: ${TRAEFIK_NETWORK:?set TRAEFIK_NETWORK}
+
+volumes:
+  hermes-mcp-jobs:

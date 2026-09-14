@@ -12,9 +12,13 @@ release / clean-slate).
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import logging
 import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Literal
 
 import uvicorn
@@ -29,8 +33,9 @@ from pydantic import AnyHttpUrl
 
 from .config import Config, LogLevel
 from .hermes_client import HermesClient, HermesError
-from .jobs import JobStore
+from .jobs import COMPLETION_SCOPE, JobStore
 from .oauth import StaticClientProvider
+from .persistent_jobs import PersistentJobStore
 
 UvicornLogLevel = Literal["critical", "error", "warning", "info", "debug"]
 _UVICORN_LEVELS: dict[LogLevel, UvicornLogLevel] = {
@@ -95,31 +100,37 @@ Args:
       - You confidently expect the response in under ~30 seconds
       - There are no Telegram-approval-gated tools likely to fire
 
-  Async behavior: `hermes_ask` returns a JSON string
-  `{"job_id":"...","status":"pending"}` immediately. Hermes runs in the
-  background. Poll `hermes_check(job_id)` every 5-10 seconds (not faster)
-  for the result. Call `hermes_cancel(job_id)` if the user no longer
-  wants the result — note this RELEASES the bookkeeping but does NOT
-  stop the gateway from running; side effects already started will
-  continue.
+  Async behavior: `hermes_ask` returns a JSON string containing a job id,
+  `status: pending`, and `completion_scope: gateway_response` immediately.
+  Poll `hermes_check(job_id)` every 5-10 seconds (not faster) for the
+  result. A `completed` bridge job proves only that the Hermes gateway
+  returned a response. If that response says work was delegated to a
+  downstream worker, queue, or service, use the same `session_id` to ask
+  Hermes for current downstream state before reporting that work complete.
+  Call `hermes_cancel(job_id)` if the user no longer wants the result —
+  note this RELEASES the bookkeeping but does NOT stop the gateway from
+  running; side effects already started will continue.
 
 Returns:
   Sync mode: Hermes's final answer text.
-  Async mode: JSON string `{"job_id":"<id>","status":"pending"}`.
+  Async mode: JSON string containing `job_id`, `status: pending`, and
+    `completion_scope: gateway_response`.
 """
 
 _CHECK_TOOL_DESCRIPTION = """\
 Check the status of an async hermes_ask job.
 
 Use this only with a `job_id` returned by a prior `hermes_ask(..., async_mode=True)`
-call. Polls Hermes Agent's in-memory job store for the result.
+call. Polls Hermes Agent's durable job store for the result.
 
 Polling guidance: wait at least 5-10 seconds between calls; Hermes jobs that
 need async mode typically take minutes, not seconds, and tight polling just
 burns the user's tokens. `completed`, `failed`, `cancelled`, and `unknown`
-are all terminal — do not keep polling after seeing them. `unknown` means
-one of: the id was never issued by this server, the result was reaped
-(24h after a terminal state) or lost on restart, or the job was wiped by
+are all terminal — do not keep polling after seeing them.
+Restart-interrupted jobs are retained as failed with an unconfirmed-outcome error.
+Never automatically resubmit them: downstream effects may already have happened.
+`unknown` means one of: the id was never issued by this server, the result was reaped
+(24h after a terminal state), or the job was wiped by
 a `hermes_reset` call. Polling will never turn `unknown` back into a result.
 
 Args:
@@ -127,17 +138,22 @@ Args:
 
 Returns:
   JSON string with `job_id`, `status` (one of `pending`, `running`,
-  `completed`, `failed`, `cancelled`, `unknown`), `created_at` (epoch
-  seconds), `prompt_chars`, and:
+  `completed`, `failed`, `cancelled`, `unknown`), `completion_scope`
+  (`gateway_response`), `created_at` (epoch seconds), `prompt_chars`, and:
     - `session_id` if the caller supplied one
     - `finished_at` (epoch seconds) once terminal
     - `result` on completed
     - `error` on failed
   Jobs are kept ~24 hours after they reach a terminal state.
+
+  `status: completed` applies to the gateway request only. If `result`
+  reports that Hermes handed work to another worker, queue, or service,
+  query that downstream state separately before declaring the user's work
+  complete.
 """
 
 _RESET_TOOL_DESCRIPTION = """\
-Clear ALL jobs from this server's in-memory job store.
+Clear ALL jobs from this server's durable job store.
 
 Use this to recover from a cluttered or stuck queue when you want a clean
 slate without restarting the server process. After this returns, every
@@ -217,7 +233,7 @@ def _build_transport_security(config: Config) -> TransportSecuritySettings:
 
 def _run_job(
     client: HermesClient,
-    jobs: JobStore,
+    jobs: JobStore | PersistentJobStore,
     job_id: str,
     prompt: str,
     session_id: str | None,
@@ -246,14 +262,13 @@ def _run_job(
 def build_app(
     config: Config,
     client: HermesClient,
-    jobs: JobStore | None = None,
+    jobs: JobStore | PersistentJobStore | None = None,
 ) -> FastMCP:
     """Create a FastMCP server with the hermes_ask, hermes_check,
     hermes_cancel, and hermes_reset tools wired up.
 
     `jobs` is exposed so tests can inject a store with a short TTL or a
-    small capacity. In normal use a fresh `JobStore()` is created per app
-    instance.
+    small capacity. Normal operation opens a process-owned persistent SQLite store.
     """
     provider = StaticClientProvider(
         client_id=config.oauth_client_id,
@@ -261,6 +276,15 @@ def build_app(
         bearer_token=config.mcp_bearer_token,
         allowed_redirect_schemes=frozenset(config.allowed_redirect_schemes),
     )
+
+    @asynccontextmanager
+    async def lifespan(_server: FastMCP) -> AsyncIterator[dict[str, object]]:
+        asyncio.get_running_loop().set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=config.executor_workers, thread_name_prefix="hermes-mcp-io"
+            )
+        )
+        yield {}
 
     issuer_url = AnyHttpUrl(config.oauth_issuer_url)
     resource_server_url = AnyHttpUrl(f"{config.oauth_issuer_url}/mcp")
@@ -271,6 +295,7 @@ def build_app(
         port=config.bind_port,
         log_level=config.log_level,
         stateless_http=False,
+        lifespan=lifespan,
         auth_server_provider=provider,
         auth=AuthSettings(
             issuer_url=issuer_url,
@@ -281,10 +306,10 @@ def build_app(
         transport_security=_build_transport_security(config),
     )
 
-    job_store = jobs if jobs is not None else JobStore()
+    job_store = jobs if jobs is not None else PersistentJobStore(config.job_store_path)
 
     @mcp.tool(description=_TOOL_DESCRIPTION)
-    def hermes_ask(
+    async def hermes_ask(
         prompt: str,
         session_id: str | None = None,
         toolsets: list[str] | None = None,
@@ -292,9 +317,11 @@ def build_app(
     ) -> str:
         # HermesError propagates; FastMCP wraps any Exception in ToolError.
         if not async_mode:
-            return client.ask(prompt, session_id=session_id, toolsets=toolsets)
+            return await client.ask_async(prompt, session_id=session_id, toolsets=toolsets)
 
-        job = job_store.create(prompt_chars=len(prompt), session_id=session_id)
+        job = await asyncio.to_thread(
+            job_store.create, prompt_chars=len(prompt), session_id=session_id
+        )
         logger.info(
             "async job %s queued (prompt_chars=%d session=%s)",
             job.job_id,
@@ -308,31 +335,49 @@ def build_app(
             daemon=True,
         )
         thread.start()
-        return json.dumps({"job_id": job.job_id, "status": "pending"})
+        return json.dumps(
+            {
+                "job_id": job.job_id,
+                "status": "pending",
+                "completion_scope": COMPLETION_SCOPE,
+            }
+        )
 
     @mcp.tool(description=_CHECK_TOOL_DESCRIPTION)
-    def hermes_check(job_id: str) -> str:
-        job = job_store.get(job_id)
+    async def hermes_check(job_id: str) -> str:
+        job = await asyncio.to_thread(job_store.get, job_id)
         if job is None:
-            return json.dumps({"job_id": job_id, "status": "unknown"})
+            return json.dumps(
+                {
+                    "job_id": job_id,
+                    "status": "unknown",
+                    "completion_scope": COMPLETION_SCOPE,
+                }
+            )
         return json.dumps(job.to_dict())
 
     @mcp.tool(description=_RESET_TOOL_DESCRIPTION)
-    def hermes_reset() -> str:
-        cleared, by_status = job_store.reset_all()
+    async def hermes_reset() -> str:
+        cleared, by_status = await asyncio.to_thread(job_store.reset_all)
         return json.dumps({"cleared": cleared, "by_status": by_status})
 
     @mcp.tool(description=_CANCEL_TOOL_DESCRIPTION)
-    def hermes_cancel(job_id: str) -> str:
+    async def hermes_cancel(job_id: str) -> str:
         # Best-effort mark; the worker thread may already have finished.
-        changed = job_store.mark_cancelled(job_id)
-        job = job_store.get(job_id)
+        changed = await asyncio.to_thread(job_store.mark_cancelled, job_id)
+        job = await asyncio.to_thread(job_store.get, job_id)
         if job is None:
             # Unknown id — never issued by this server (reap-between-calls
             # is impossible: mark_cancelled would have just set finished_at,
             # and the reap window is 24h, so a freshly-cancelled job cannot
             # vanish here).
-            return json.dumps({"job_id": job_id, "status": "unknown"})
+            return json.dumps(
+                {
+                    "job_id": job_id,
+                    "status": "unknown",
+                    "completion_scope": COMPLETION_SCOPE,
+                }
+            )
         if changed:
             logger.info("async job %s cancelled by caller", job_id)
         return json.dumps(job.to_dict())

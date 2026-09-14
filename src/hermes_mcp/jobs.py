@@ -5,10 +5,9 @@ a job, returns its id immediately, and runs the gateway call in a background
 thread. The caller polls `hermes_check(job_id)` to retrieve the result, or
 calls `hermes_cancel(job_id)` to release the result (see warning below).
 
-This sits next to OAuth state in `oauth.py`: in-memory only, by design. A
-server restart loses every in-flight or completed job — documented in
-`README.md`. Persisting to disk is on the v0.4.0 roadmap if it turns out to
-bite users.
+The production server uses PersistentJobStore (persistent_jobs.py), which
+shares this Job record format. This in-memory implementation remains available
+for isolated tests and explicit dependency injection. OAuth state is separate.
 
 About "cancellation": Python threads cannot be safely killed mid-IO, so
 `mark_cancelled` is a **tombstone**. It updates this server's bookkeeping
@@ -40,6 +39,12 @@ logger = logging.getLogger(__name__)
 
 JobStatus = Literal["pending", "running", "completed", "failed", "cancelled", "unknown"]
 
+# An async MCP job ends when the Hermes gateway returns. The returned Hermes
+# message may itself be a receipt for work delegated to another worker, queue,
+# or service. Exposing that boundary in every job record prevents callers from
+# treating a successful bridge response as proof that downstream work finished.
+COMPLETION_SCOPE = "gateway_response"
+
 TERMINAL_STATUSES: frozenset[JobStatus] = frozenset({"completed", "failed", "cancelled"})
 
 DEFAULT_TTL_SECONDS = 24 * 60 * 60
@@ -62,13 +67,15 @@ class Job:
     def to_dict(self) -> dict[str, object]:
         """Serializable shape returned to the MCP client.
 
-        Always includes `job_id`, `status`, `created_at`, `prompt_chars`.
+        Always includes `job_id`, `status`, `completion_scope`, `created_at`,
+        `prompt_chars`.
         Includes `session_id` only when supplied by the caller, `finished_at`
         only when terminal, and `result`/`error` only when applicable.
         """
         d: dict[str, object] = {
             "job_id": self.job_id,
             "status": self.status,
+            "completion_scope": COMPLETION_SCOPE,
             "created_at": self.created_at,
             "prompt_chars": self.prompt_chars,
         }

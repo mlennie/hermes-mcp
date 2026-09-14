@@ -5,9 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- Keep MCP responsive during a long synchronous-mode Hermes request using async HTTP.
+- Persist job results in SQLite across restarts; retain interrupted jobs with an explicit
+  unconfirmed outcome and never automatically replay work.
+- Configure short-I/O executor capacity (16 threads by default), keeping one server worker.
+- Preserve Town completion-scope metadata and existing bearer/OAuth behavior.
+- Add durable Docker volumes, a writable systemd database path, and an upgrade guide.
+- Add concurrency, restart, state-transition, timeout/error, and configuration regression tests.
+
 ## [Unreleased]
 
+### Fixed
+
+- Pin the Model Context Protocol SDK below 2.0 so a clean install does not
+  select the incompatible 2.x API, where `FastMCP` was renamed.
+
 ### Added
+- Docker image and Traefik Compose example for running the bridge beside a
+  containerized Hermes gateway, plus a Town/Hostinger setup and verification
+  guide.
+- Hostinger sidecar Compose example for the managed Hermes application's
+  shared-network-namespace deployment pattern.
+- Reusable Town routine template for durable-session routing, explicit status states,
+  authority boundaries, source reconciliation, and duplicate-work prevention.
+- Plain-language start guide for non-coders using Town and Hostinger.
+- `completion_scope: "gateway_response"` in async job responses so callers do
+  not mistake a bridge response for completion of separately delegated work.
 - **Static bearer-token auth as an alternative to OAuth.** New optional
   env var `MCP_BEARER_TOKEN` (32+ chars). When set, the server accepts
   `Authorization: Bearer <MCP_BEARER_TOKEN>` directly at /mcp, in

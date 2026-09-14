@@ -14,11 +14,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import secrets
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from starlette.testclient import TestClient
 
 from hermes_mcp.config import Config
+from hermes_mcp.jobs import JobStore
 from hermes_mcp.server import build_app
 
 VALID_ENV: dict[str, str] = {
@@ -34,7 +35,8 @@ def _build_client(env: dict[str, str] | None = None) -> TestClient:
     cfg = Config.from_env(env or VALID_ENV)
     hermes = MagicMock()
     hermes.ask.return_value = "alive"
-    mcp = build_app(cfg, hermes)
+    hermes.ask_async = AsyncMock(return_value="alive")
+    mcp = build_app(cfg, hermes, jobs=JobStore())
     return TestClient(mcp.streamable_http_app(), base_url="http://localhost:8765")
 
 

@@ -12,11 +12,11 @@
 
 ## Security impact
 
-<!-- hermes-mcp is a thin auth+subprocess wrapper. Before merging, confirm:
+<!-- hermes-mcp is a thin auth + HTTP gateway wrapper. Before merging, confirm:
   - Does this change the authentication or bearer-token handling? If yes, describe.
-  - Does this change how argv is constructed for the hermes subprocess? If yes, confirm shell=True is still absent.
+  - Does this change requests to the configured Hermes gateway? If yes, describe.
   - Does this add logging of prompt content above DEBUG level? It must not.
-  - Does this add any outbound network call from hermes-mcp itself? It must not (no telemetry policy).
+  - Does this add any outbound network call beyond the configured Hermes gateway? It must not (no telemetry policy).
 If none of the above apply, write "None." -->
 
 ## Testing done

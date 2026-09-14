@@ -194,3 +194,22 @@ def test_bearer_token_too_short_rejected() -> None:
 def test_bearer_token_whitespace_only_treated_as_unset() -> None:
     cfg = Config.from_env({**VALID_BASE, "MCP_BEARER_TOKEN": "   "})
     assert cfg.mcp_bearer_token is None
+
+
+def test_job_store_and_executor_configuration() -> None:
+    cfg = Config.from_env(
+        {
+            **VALID_BASE,
+            "HERMES_MCP_JOB_STORE_PATH": "/data/jobs.sqlite3",
+            "HERMES_MCP_EXECUTOR_WORKERS": "24",
+        }
+    )
+    assert cfg.job_store_path == "/data/jobs.sqlite3"
+    assert cfg.executor_workers == 24
+    assert Config.from_env(VALID_BASE).executor_workers == 16
+
+
+@pytest.mark.parametrize("value", ["0", "129", "bad", "1.5"])
+def test_invalid_executor_size(value: str) -> None:
+    with pytest.raises(ConfigError, match="HERMES_MCP_EXECUTOR_WORKERS"):
+        Config.from_env({**VALID_BASE, "HERMES_MCP_EXECUTOR_WORKERS": value})

@@ -178,3 +178,58 @@ def test_ask_does_not_log_prompt_at_info(
         _client().ask("VERY-PRIVATE-PROMPT-CONTENT-XYZ")
     for rec in caplog.records:
         assert "VERY-PRIVATE-PROMPT-CONTENT-XYZ" not in rec.message
+
+
+async def test_async_request_preserves_session_and_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    actual_client = httpx.AsyncClient
+    seen = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=_ok_response(" async answer "))
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: actual_client(transport=httpx.MockTransport(respond), **kw),
+    )
+    assert await _client().ask_async("hello", session_id="durable-session") == "async answer"
+    assert seen[0].headers["X-Hermes-Session-Id"] == "durable-session"
+    assert seen[0].headers["Authorization"] == "Bearer " + "k" * 32
+    assert json.loads(seen[0].content)["messages"] == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.parametrize(
+    "kind,match",
+    [
+        ("timeout", "timed out after 60s"),
+        ("unauthorized", "rejected the API key"),
+        ("server", "HTTP 503"),
+        ("malformed", "malformed response"),
+        ("invalid_content", "response.content was int"),
+    ],
+)
+async def test_async_error_parity(monkeypatch: pytest.MonkeyPatch, kind: str, match: str) -> None:
+    actual_client = httpx.AsyncClient
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if kind == "timeout":
+            raise httpx.ReadTimeout("fixture", request=request)
+        if kind == "unauthorized":
+            return httpx.Response(401)
+        if kind == "server":
+            return httpx.Response(503, text="private gateway output")
+        if kind == "invalid_content":
+            return httpx.Response(200, json={"choices": [{"message": {"content": 42}}]})
+        return httpx.Response(200, text="private malformed output")
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: actual_client(transport=httpx.MockTransport(respond), **kw),
+    )
+    with pytest.raises(HermesError, match=match) as exc:
+        await _client().ask_async("hello")
+    assert "private" not in str(exc.value)

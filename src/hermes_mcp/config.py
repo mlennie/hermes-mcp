@@ -10,7 +10,8 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 from hermes_mcp.oauth import DEFAULT_ALLOWED_REDIRECT_SCHEMES as _DEFAULT_SCHEMES
@@ -50,6 +51,10 @@ class Config:
     # config) and have no OAuth flow.
     mcp_bearer_token: str | None
     log_level: LogLevel
+    job_store_path: str = field(
+        default_factory=lambda: str(Path.home() / ".local/state/hermes-mcp/jobs.sqlite3")
+    )
+    executor_workers: int = 16
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -161,7 +166,18 @@ class Config:
                 bind_host,
             )
 
+        job_store_path = (e.get("HERMES_MCP_JOB_STORE_PATH") or "").strip() or str(
+            Path.home() / ".local/state/hermes-mcp/jobs.sqlite3"
+        )
+        try:
+            executor_workers = int(e.get("HERMES_MCP_EXECUTOR_WORKERS", "16"))
+        except ValueError as exc:
+            raise ConfigError("HERMES_MCP_EXECUTOR_WORKERS must be an integer") from exc
+        if not 1 <= executor_workers <= 128:
+            raise ConfigError("HERMES_MCP_EXECUTOR_WORKERS must be in 1..128")
         return cls(
+            job_store_path=job_store_path,
+            executor_workers=executor_workers,
             oauth_client_id=client_id,
             oauth_client_secret=client_secret,
             oauth_issuer_url=issuer_url,

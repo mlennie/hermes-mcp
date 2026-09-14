@@ -1,0 +1,4 @@
+# Minimal fixture used only to validate the Hostinger sidecar override in CI.
+services:
+  hermes-agent:
+    image: ghcr.io/hostinger/hvps-hermes-agent:latest

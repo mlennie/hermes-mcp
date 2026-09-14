@@ -37,3 +37,32 @@ jobs:
 
       - name: Tests (pytest)
         run: pytest
+
+  container:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Traefik Compose example
+        env:
+          HERMES_MCP_ENV_FILE: ./hermes-mcp.env.example
+        run: >-
+          docker compose
+          --env-file deploy/hermes-mcp.env.example
+          -f deploy/docker-compose.traefik.yml
+          config --quiet
+
+      - name: Validate Hostinger sidecar Compose example
+        env:
+          HERMES_MCP_ENV_FILE: ../../deploy/hermes-mcp.env.example
+          HERMES_MCP_BUILD_CONTEXT: ../..
+        run: >-
+          docker compose
+          --env-file deploy/hermes-mcp.env.example
+          -f .github/fixtures/docker-compose.hostinger-base.yml
+          -f deploy/docker-compose.hostinger-sidecar.yml
+          config --quiet
+
+      - name: Build container image
+        run: docker build --tag hermes-mcp:ci .

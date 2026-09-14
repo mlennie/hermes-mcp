@@ -51,6 +51,7 @@ coverage.xml
 
 # Env
 .env
+deploy/hermes-mcp.env
 .env.local
 .env.*.local
 
