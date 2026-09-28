@@ -3,9 +3,14 @@ from __future__ import annotations
 import pytest
 
 from hermes_mcp.config import (
-    DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES,
+    DEFAULT_OAUTH_ALLOWED_REDIRECT_URIS,
     Config,
     ConfigError,
+)
+
+CLAUDE_CALLBACKS = (
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
 )
 
 VALID_BASE: dict[str, str] = {
@@ -78,7 +83,7 @@ def test_minimal_valid_config() -> None:
     assert cfg.bind_host == "127.0.0.1"
     assert cfg.bind_port == 8765
     assert cfg.allowed_hosts == ()
-    assert cfg.allowed_redirect_schemes == DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES
+    assert cfg.allowed_redirect_uris == DEFAULT_OAUTH_ALLOWED_REDIRECT_URIS
     assert cfg.log_level == "INFO"
 
 
@@ -131,44 +136,116 @@ def test_log_level_normalized_to_upper() -> None:
     assert cfg.log_level == "DEBUG"
 
 
-# --- OAUTH_ALLOWED_REDIRECT_SCHEMES --------------------------------------------
+# --- OAUTH_ALLOWED_REDIRECT_URIS -----------------------------------------------
 
 
-def test_allowed_redirect_schemes_defaults_when_unset() -> None:
+def test_allowed_redirect_uris_default_to_claude_callbacks() -> None:
     cfg = Config.from_env(VALID_BASE)
-    assert cfg.allowed_redirect_schemes == ("claude", "claudeai", "cursor")
+    assert cfg.allowed_redirect_uris == CLAUDE_CALLBACKS
 
 
-def test_allowed_redirect_schemes_parsed_with_whitespace() -> None:
+def test_allowed_redirect_uris_parsed_with_whitespace() -> None:
     cfg = Config.from_env(
-        {**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_SCHEMES": " claude , cursor ,  vscode "}
+        {
+            **VALID_BASE,
+            "OAUTH_ALLOWED_REDIRECT_URIS": (
+                " https://claude.ai/api/mcp/auth_callback , http://localhost:6274/cb "
+            ),
+        }
     )
-    assert cfg.allowed_redirect_schemes == ("claude", "cursor", "vscode")
+    assert cfg.allowed_redirect_uris == (
+        "https://claude.ai/api/mcp/auth_callback",
+        "http://localhost:6274/cb",
+    )
 
 
-def test_allowed_redirect_schemes_lowercased() -> None:
-    cfg = Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_SCHEMES": "Claude,CURSOR"})
-    assert cfg.allowed_redirect_schemes == ("claude", "cursor")
+def test_allowed_redirect_uris_replaces_default_when_set() -> None:
+    """Explicit env var fully replaces the default — it's not additive."""
+    cfg = Config.from_env(
+        {**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_URIS": "https://app.example.com/cb"}
+    )
+    assert cfg.allowed_redirect_uris == ("https://app.example.com/cb",)
 
 
-def test_allowed_redirect_schemes_replaces_default_when_set() -> None:
-    """Explicit env var fully replaces the default — it's not additive.
-    Operators who want claude+claudeai+cursor+vscode must list all four."""
-    cfg = Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_SCHEMES": "vscode"})
-    assert cfg.allowed_redirect_schemes == ("vscode",)
+def test_allowed_redirect_uris_empty_falls_back_to_default() -> None:
+    """A typo like `,` or whitespace would otherwise parse to an empty tuple
+    and lock every client out. Treat an empty parse result as 'unset'."""
+    for raw in ("", "  ", ",", ",,,", " , , ,"):
+        cfg = Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_URIS": raw})
+        assert cfg.allowed_redirect_uris == CLAUDE_CALLBACKS, raw
 
 
-def test_allowed_redirect_schemes_empty_string_falls_back_to_default() -> None:
-    cfg = Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_SCHEMES": "  "})
-    assert cfg.allowed_redirect_schemes == ("claude", "claudeai", "cursor")
+def test_allowed_redirect_uris_loopback_http_allowed() -> None:
+    for uri in ("http://localhost:6274/cb", "http://127.0.0.1:9999/cb", "http://[::1]:9999/cb"):
+        cfg = Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_URIS": uri})
+        assert cfg.allowed_redirect_uris == (uri,)
 
 
-def test_allowed_redirect_schemes_comma_only_falls_back_to_default() -> None:
-    """A typo like `,` or `,,,` would otherwise parse to an empty tuple and
-    silently disable every custom scheme. Treat empty parse result as 'unset'."""
-    for raw in (",", ",,,", " , , ,"):
-        cfg = Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_SCHEMES": raw})
-        assert cfg.allowed_redirect_schemes == ("claude", "claudeai", "cursor"), raw
+def test_allowed_redirect_uris_reject_non_https() -> None:
+    for bad in (
+        "http://example.com/cb",
+        "http://localhost.attacker.example/cb",
+        "claude://oauth/callback",
+        "cursor://anysphere.cursor-mcp/cb",
+        "javascript:alert(1)",
+        "https://",
+        "not a url",
+    ):
+        with pytest.raises(ConfigError, match="OAUTH_ALLOWED_REDIRECT_URIS"):
+            Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_URIS": bad})
+
+
+def test_one_bad_redirect_uri_rejects_whole_list() -> None:
+    with pytest.raises(ConfigError, match="OAUTH_ALLOWED_REDIRECT_URIS"):
+        Config.from_env(
+            {
+                **VALID_BASE,
+                "OAUTH_ALLOWED_REDIRECT_URIS": "https://claude.ai/api/mcp/auth_callback,http://x.example/cb",
+            }
+        )
+
+
+def test_deprecated_redirect_schemes_var_warns_but_does_not_crash(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Deployments that still set OAUTH_ALLOWED_REDIRECT_SCHEMES must keep
+    starting; the value is ignored (it no longer widens the allowlist) and a
+    deprecation warning is logged."""
+    with caplog.at_level("WARNING", logger="hermes_mcp.config"):
+        cfg = Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_SCHEMES": "claude,cursor"})
+    assert cfg.allowed_redirect_uris == CLAUDE_CALLBACKS
+    msgs = [r.message for r in caplog.records if "OAUTH_ALLOWED_REDIRECT_SCHEMES" in r.message]
+    assert len(msgs) == 1
+    assert "deprecated" in msgs[0]
+
+
+def test_deprecated_redirect_schemes_var_unset_no_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="hermes_mcp.config"):
+        Config.from_env({**VALID_BASE, "OAUTH_ALLOWED_REDIRECT_SCHEMES": "  "})
+    assert not [r for r in caplog.records if "OAUTH_ALLOWED_REDIRECT_SCHEMES" in r.message]
+
+
+# --- repr ----------------------------------------------------------------------
+
+
+def test_repr_hides_secrets() -> None:
+    secret, api_key, bearer = "S" * 40, "K" * 40, "B" * 40
+    cfg = Config.from_env(
+        {
+            **VALID_BASE,
+            "OAUTH_CLIENT_SECRET": secret,
+            "HERMES_API_KEY": api_key,
+            "MCP_BEARER_TOKEN": bearer,
+        }
+    )
+    r = repr(cfg)
+    assert "hermes-mcp-test" in r  # non-secret fields still shown
+    for value in (secret, api_key, bearer):
+        assert value not in r
+    for name in ("oauth_client_secret", "hermes_api_key", "mcp_bearer_token"):
+        assert name not in r
 
 
 # --- MCP_BEARER_TOKEN --------------------------------------------

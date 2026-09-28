@@ -9,20 +9,25 @@ from mcp.server.auth.provider import AuthorizationCode, AuthorizationParams
 from mcp.shared.auth import InvalidRedirectUriError, OAuthClientInformationFull
 from pydantic import AnyUrl
 
-from hermes_mcp.oauth import StaticClientProvider, mint_bearer_token, mint_client_credentials
+from hermes_mcp.oauth import (
+    DEFAULT_ALLOWED_REDIRECT_URIS,
+    MAX_OUTSTANDING_AUTH_CODES,
+    StaticClientProvider,
+    mint_bearer_token,
+    mint_client_credentials,
+)
 
 CLIENT_ID = "hermes-mcp-test"
 CLIENT_SECRET = "s" * 48
 BEARER_TOKEN = "b" * 48
+CLAUDE_CALLBACK = "https://claude.ai/api/mcp/auth_callback"
 
 
 def _provider(**kwargs: int) -> StaticClientProvider:
     return StaticClientProvider(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, **kwargs)
 
 
-def _params(
-    redirect_uri: str = "https://app.example.com/cb", state: str | None = "st-1"
-) -> AuthorizationParams:
+def _params(redirect_uri: str = CLAUDE_CALLBACK, state: str | None = "st-1") -> AuthorizationParams:
     return AuthorizationParams(
         state=state,
         scopes=[],
@@ -50,19 +55,19 @@ def test_constructor_rejects_empty_credentials() -> None:
         StaticClientProvider(client_id=CLIENT_ID, client_secret="")
 
 
-def test_get_client_returns_static_client_as_public_pkce_only() -> None:
-    """The registered client is a public client: `client_secret=None` and
-    `token_endpoint_auth_method="none"`. This lets the SDK skip the
-    client_secret check at /token (`mcp/server/auth/middleware/client_auth.py`
-    branches on `client.client_secret` being truthy) while keeping PKCE
-    mandatory. This is what unlocks Codex CLI / Cursor, whose MCP OAuth
-    configs only carry `client_id`."""
+def test_get_client_returns_confidential_client() -> None:
+    """The registered client is confidential: it carries the configured
+    `client_secret` and `token_endpoint_auth_method="client_secret_post"`, so
+    the SDK's ClientAuthenticator enforces the secret on every /token
+    request. PKCE alone must NOT be enough to mint tokens: /authorize
+    auto-approves, so a public client would let anyone who knows the
+    client_id mint a token."""
     p = _provider()
     client = asyncio.run(p.get_client(CLIENT_ID))
     assert client is not None
     assert client.client_id == CLIENT_ID
-    assert client.client_secret is None
-    assert client.token_endpoint_auth_method == "none"
+    assert client.client_secret == CLIENT_SECRET
+    assert client.token_endpoint_auth_method == "client_secret_post"
 
 
 def test_get_client_unknown_returns_none() -> None:
@@ -81,98 +86,88 @@ def test_authorize_returns_redirect_with_code_and_state() -> None:
     p = _provider()
     client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
     redirect = asyncio.run(p.authorize(client, _params()))
-    assert redirect.startswith("https://app.example.com/cb")
+    assert redirect.startswith(CLAUDE_CALLBACK)
     assert "code=" in redirect
     assert "state=st-1" in redirect
 
 
-def test_validate_redirect_uri_allows_expected_schemes() -> None:
-    p = _provider()
-    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
-    # Public-suffix HTTPS URLs.
-    assert client.validate_redirect_uri(AnyUrl("https://app.example.com/cb")) is not None
-    # Default custom schemes covering Claude Desktop / Claude.ai / Cursor.
-    assert client.validate_redirect_uri(AnyUrl("claude://oauth/callback")) is not None
-    assert client.validate_redirect_uri(AnyUrl("claudeai://oauth/callback")) is not None
-    assert client.validate_redirect_uri(AnyUrl("cursor://anysphere.cursor-mcp/cb")) is not None
-    # http only on localhost.
-    assert client.validate_redirect_uri(AnyUrl("http://localhost:9999/x")) is not None
-    assert client.validate_redirect_uri(AnyUrl("http://127.0.0.1:9999/x")) is not None
-
-
-def test_validate_redirect_uri_rejects_scheme_not_in_default_allowlist() -> None:
-    """A custom scheme not in the default set (e.g. `vscode://`) is rejected
-    unless the operator adds it to OAUTH_ALLOWED_REDIRECT_SCHEMES."""
-    p = _provider()
-    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
-    with pytest.raises(InvalidRedirectUriError, match="not allowed"):
-        client.validate_redirect_uri(AnyUrl("vscode://continue.continue/oauth/callback"))
-
-
-def test_validate_redirect_uri_accepts_custom_scheme_when_configured() -> None:
-    """Operator adds `vscode` to OAUTH_ALLOWED_REDIRECT_SCHEMES → accepted."""
-    p = StaticClientProvider(
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-        allowed_redirect_schemes=frozenset({"vscode"}),
-    )
-    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+def test_default_redirect_allowlist_is_claude_callbacks() -> None:
     assert (
-        client.validate_redirect_uri(AnyUrl("vscode://continue.continue/oauth/callback"))
-        is not None
+        frozenset(
+            {
+                "https://claude.ai/api/mcp/auth_callback",
+                "https://claude.com/api/mcp/auth_callback",
+            }
+        )
+        == DEFAULT_ALLOWED_REDIRECT_URIS
     )
 
 
-def test_validate_redirect_uri_baseline_always_allowed_regardless_of_config() -> None:
-    """`https` and `http`-on-localhost are baseline schemes; they're allowed
-    even if the operator configures an allowlist that excludes them. This is
-    the security floor for Codex CLI's HTTPS callbacks and for local testing."""
-    p = StaticClientProvider(
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-        allowed_redirect_schemes=frozenset({"vscode"}),  # deliberately omits https/http
-    )
+def test_validate_redirect_uri_accepts_default_claude_callbacks() -> None:
+    p = _provider()
     client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
-    assert client.validate_redirect_uri(AnyUrl("https://app.example.com/cb")) is not None
-    assert client.validate_redirect_uri(AnyUrl("http://localhost:9999/cb")) is not None
+    for uri in DEFAULT_ALLOWED_REDIRECT_URIS:
+        assert str(client.validate_redirect_uri(AnyUrl(uri))) == uri
 
 
-def test_validate_redirect_uri_default_claude_schemes_rejected_under_custom_config() -> None:
-    """If the operator explicitly configures schemes without `claude`/`claudeai`,
-    those schemes are no longer accepted — the env var fully replaces the
-    default custom-scheme list (baseline stays intact)."""
-    p = StaticClientProvider(
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-        allowed_redirect_schemes=frozenset({"cursor"}),  # only cursor; no claude
-    )
-    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
-    with pytest.raises(InvalidRedirectUriError, match="not allowed"):
-        client.validate_redirect_uri(AnyUrl("claude://oauth/callback"))
-
-
-def test_validate_redirect_uri_rejects_dangerous_schemes() -> None:
-    """The /authorize redirect must not become an open redirector to javascript:
-    or data: URIs even though PKCE protects token exchange."""
+def test_validate_redirect_uri_rejects_unpinned_uris() -> None:
+    """Only exact, pre-configured URIs are accepted. Any other https URL
+    (the old scheme allowlist accepted all of them), look-alike hosts,
+    extra path/query, custom schemes, and dangerous schemes are rejected, so
+    /authorize can't be used as an open redirector."""
     p = _provider()
     client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
     for evil in (
+        "https://attacker.example/cb",
+        "https://app.example.com/cb",
+        "https://claude.ai.attacker.example/api/mcp/auth_callback",
+        "https://claude.ai/api/mcp/auth_callback/extra",
+        "https://claude.ai/api/mcp/auth_callback?next=https://attacker.example",
+        "https://claude.ai/api/mcp/other_callback",
+        "http://claude.ai/api/mcp/auth_callback",
+        "http://localhost:9999/cb",
+        "claude://oauth/callback",
+        "cursor://anysphere.cursor-mcp/cb",
         "javascript:alert(1)",
         "data:text/html,<script>alert(1)</script>",
         "file:///etc/passwd",
-        "ftp://example.com/x",
     ):
         with pytest.raises(InvalidRedirectUriError, match="not allowed"):
             client.validate_redirect_uri(AnyUrl(evil))
 
 
-def test_validate_redirect_uri_rejects_http_to_remote_host() -> None:
-    """http:// is allowed only for localhost — preserves loopback testing
-    without exposing the bridge to plaintext phishing redirects."""
-    p = _provider()
+def test_validate_redirect_uri_configured_list_replaces_default() -> None:
+    p = StaticClientProvider(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        allowed_redirect_uris=frozenset({"https://app.example.com/cb", "http://localhost:9999/cb"}),
+    )
     client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
-    with pytest.raises(InvalidRedirectUriError, match="only allowed for localhost"):
-        client.validate_redirect_uri(AnyUrl("http://evil.example.com/cb"))
+    assert client.validate_redirect_uri(AnyUrl("https://app.example.com/cb")) is not None
+    assert client.validate_redirect_uri(AnyUrl("http://localhost:9999/cb")) is not None
+    with pytest.raises(InvalidRedirectUriError, match="not allowed"):
+        client.validate_redirect_uri(AnyUrl(CLAUDE_CALLBACK))
+
+
+def test_configured_redirect_uris_are_normalized_like_the_request() -> None:
+    """The SDK hands us the requested redirect_uri as a pydantic AnyUrl, which
+    lower-cases the host and adds a `/` to an empty path. Configured entries
+    get the same normalization so an operator's spelling can't silently
+    fail to match."""
+    p = StaticClientProvider(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        allowed_redirect_uris=frozenset({"https://App.Example.com"}),
+    )
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    assert client.validate_redirect_uri(AnyUrl("https://app.example.com/")) is not None
+
+
+def test_constructor_rejects_empty_redirect_allowlist() -> None:
+    with pytest.raises(ValueError, match="redirect URI"):
+        StaticClientProvider(
+            client_id=CLIENT_ID, client_secret=CLIENT_SECRET, allowed_redirect_uris=frozenset()
+        )
 
 
 def test_validate_redirect_uri_rejects_none() -> None:
@@ -346,29 +341,55 @@ def test_expired_refresh_token_rejected() -> None:
     assert asyncio.run(p.load_refresh_token(client, rt_token)) is None
 
 
-def test_authorize_caps_outstanding_codes() -> None:
-    """A drive-by attacker can't grow _auth_codes unboundedly."""
-    from mcp.server.auth.provider import AuthorizeError
-
-    from hermes_mcp.oauth import MAX_OUTSTANDING_AUTH_CODES
-
-    p = _provider()
-    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
-    # Pre-fill to the cap with codes that won't reap (expires_at far in future).
-    far_future = time.time() + 10_000
-    for i in range(MAX_OUTSTANDING_AUTH_CODES):
+def _fill_codes(p: StaticClientProvider, n: int, expires_at: float) -> None:
+    for i in range(n):
         p._auth_codes[f"code-{i}"] = AuthorizationCode(
             code=f"code-{i}",
             scopes=[],
-            expires_at=far_future,
+            expires_at=expires_at,
             client_id=CLIENT_ID,
             code_challenge="x",
-            redirect_uri=AnyUrl("https://app.example.com/cb"),
+            redirect_uri=AnyUrl(CLAUDE_CALLBACK),
             redirect_uri_provided_explicitly=True,
             resource=None,
         )
-    with pytest.raises(AuthorizeError, match="Too many"):
+
+
+def test_authorize_flood_evicts_oldest_code(caplog: pytest.LogCaptureFixture) -> None:
+    """A drive-by flood of /authorize can't grow _auth_codes unboundedly, AND
+    can't lock the real user out: at the cap the oldest code is evicted and
+    the new request still succeeds."""
+    p = _provider()
+    client = cast(OAuthClientInformationFull, asyncio.run(p.get_client(CLIENT_ID)))
+    # Pre-fill to the cap with codes that won't reap (expires_at far in future).
+    _fill_codes(p, MAX_OUTSTANDING_AUTH_CODES, time.time() + 10_000)
+    with caplog.at_level("WARNING", logger="hermes_mcp.oauth"):
+        redirect = asyncio.run(p.authorize(client, _params()))
         asyncio.run(p.authorize(client, _params()))
+    new_code = redirect.split("code=")[1].split("&")[0]
+    assert len(p._auth_codes) == MAX_OUTSTANDING_AUTH_CODES
+    assert "code-0" not in p._auth_codes  # oldest evicted first
+    assert "code-1" not in p._auth_codes  # then the next-oldest
+    assert "code-2" in p._auth_codes
+    assert new_code in p._auth_codes
+    # The newly issued code is still redeemable.
+    auth_code = asyncio.run(p.load_authorization_code(client, new_code))
+    assert auth_code is not None
+    assert asyncio.run(p.exchange_authorization_code(client, auth_code)).access_token
+    cap_logs = [r for r in caplog.records if "cap" in r.message]
+    assert len(cap_logs) == 1, "cap warning should be logged once, not per request"
+
+
+def test_repr_hides_secrets() -> None:
+    p = StaticClientProvider(
+        client_id=CLIENT_ID, client_secret=CLIENT_SECRET, bearer_token=BEARER_TOKEN
+    )
+    r = repr(p)
+    assert CLIENT_ID in r
+    assert CLIENT_SECRET not in r
+    assert BEARER_TOKEN not in r
+    assert "client_secret" not in r
+    assert "bearer_token" not in r
 
 
 def test_authorize_reaps_expired_codes_before_capping() -> None:
@@ -383,7 +404,7 @@ def test_authorize_reaps_expired_codes_before_capping() -> None:
             expires_at=long_ago,
             client_id=CLIENT_ID,
             code_challenge="x",
-            redirect_uri=AnyUrl("https://app.example.com/cb"),
+            redirect_uri=AnyUrl(CLAUDE_CALLBACK),
             redirect_uri_provided_explicitly=True,
             resource=None,
         )

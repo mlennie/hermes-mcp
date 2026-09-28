@@ -4,6 +4,9 @@
 `build_app()` constructs a FastMCP instance wired up with our static-client
 OAuth provider. FastMCP itself adds the bearer-validation middleware and the
 authorization endpoints (`/authorize`, `/token`, `/.well-known/...`).
+`build_http_app()` wraps that into the ASGI app we actually serve, with the
+authorization-server metadata corrected to advertise only the one /token
+client-auth method the static client accepts.
 
 Async-job state lives in the shared `JobStore` owned by `build_app`; the
 four tools are tightly coupled around its lifecycle (submit / poll /
@@ -18,6 +21,8 @@ import threading
 from typing import Literal
 
 import uvicorn
+from mcp.server.auth.handlers.metadata import MetadataHandler
+from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import (
     AuthSettings,
     ClientRegistrationOptions,
@@ -26,11 +31,13 @@ from mcp.server.auth.settings import (
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyHttpUrl
+from starlette.applications import Starlette
+from starlette.routing import Route
 
 from .config import Config, LogLevel
 from .hermes_client import HermesClient, HermesError
 from .jobs import JobStore
-from .oauth import StaticClientProvider
+from .oauth import TOKEN_ENDPOINT_AUTH_METHOD, StaticClientProvider
 
 UvicornLogLevel = Literal["critical", "error", "warning", "info", "debug"]
 _UVICORN_LEVELS: dict[LogLevel, UvicornLogLevel] = {
@@ -259,7 +266,7 @@ def build_app(
         client_id=config.oauth_client_id,
         client_secret=config.oauth_client_secret,
         bearer_token=config.mcp_bearer_token,
-        allowed_redirect_schemes=frozenset(config.allowed_redirect_schemes),
+        allowed_redirect_uris=frozenset(config.allowed_redirect_uris),
     )
 
     issuer_url = AnyHttpUrl(config.oauth_issuer_url)
@@ -340,16 +347,46 @@ def build_app(
     return mcp
 
 
+def build_http_app(mcp: FastMCP, config: Config) -> Starlette:
+    """The ASGI app to serve. Same as `mcp.streamable_http_app()`, except the
+    authorization-server metadata advertises only `client_secret_post`: the
+    SDK hard-codes `client_secret_basic` too, which our static client rejects
+    (the SDK's `ClientAuthenticator` only checks the one registered method),
+    so a client that picked it would fail to log in.
+    """
+    app = mcp.streamable_http_app()
+    metadata = build_metadata(
+        AnyHttpUrl(config.oauth_issuer_url),
+        None,
+        ClientRegistrationOptions(enabled=False),
+        RevocationOptions(enabled=False),
+    )
+    metadata.token_endpoint_auth_methods_supported = [TOKEN_ENDPOINT_AUTH_METHOD]
+    # First match wins, so this shadows the SDK's route of the same path.
+    app.router.routes.insert(
+        0,
+        Route(
+            "/.well-known/oauth-authorization-server",
+            endpoint=cors_middleware(MetadataHandler(metadata).handle, ["GET", "OPTIONS"]),
+            methods=["GET", "OPTIONS"],
+        ),
+    )
+    return app
+
+
 def serve(config: Config, client: HermesClient) -> None:
     mcp = build_app(config, client)
     logger.info(
-        "hermes-mcp listening on %s:%d (transport=streamable-http, oauth issuer=%s)",
+        "hermes-mcp listening on %s:%d (transport=streamable-http, oauth issuer=%s, "
+        "redirect_uris=%s, bearer=%s)",
         config.bind_host,
         config.bind_port,
         config.oauth_issuer_url,
+        ",".join(config.allowed_redirect_uris),
+        "enabled" if config.mcp_bearer_token else "disabled",
     )
     uvicorn.run(
-        mcp.streamable_http_app(),
+        build_http_app(mcp, config),
         host=config.bind_host,
         port=config.bind_port,
         log_level=_uvicorn_log_level(config.log_level),

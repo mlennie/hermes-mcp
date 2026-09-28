@@ -38,7 +38,7 @@ pytest
 - **New MCP tools.** The plan is to start with `hermes_ask` only and only add specialized tools (`hermes_schedule_cron`, etc.) when there's a clear, repeated friction in real-world use.
 - **New dependencies.** Each one is supply-chain surface. Justify in the PR description.
 - **Telemetry / analytics.** No, by policy. Don't propose this.
-- **Authentication changes.** OAuth 2.1 is the auth model. Changes that touch `oauth.py`, `RequireAuthMiddleware` wiring, or the redirect-URI scheme allowlist need a strong rationale and tests covering the security invariants.
+- **Authentication changes.** OAuth 2.1 is the auth model. Changes that touch `oauth.py`, `RequireAuthMiddleware` wiring, or the exact redirect-URI allowlist need a strong rationale and tests covering the security invariants.
 
 ## Code style
 

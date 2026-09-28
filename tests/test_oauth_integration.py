@@ -3,7 +3,10 @@
 Exercises the security-critical path that unit tests can't reach:
   - /mcp rejects unauthenticated requests
   - /mcp rejects forged bearer tokens
-  - the full PKCE round-trip (authorize -> token -> /mcp) succeeds
+  - the full round-trip (authorize -> token -> /mcp) succeeds only with the
+    client_secret AND a valid PKCE verifier
+  - /token rejects client_id-only / wrong-secret requests for every grant
+  - /authorize refuses (400, no redirect) any redirect_uri not pinned
 
 Catches regressions in FastMCP / SDK wiring (e.g., if RequireAuthMiddleware
 gets unwired or our auth_server_provider path stops registering).
@@ -19,7 +22,7 @@ from unittest.mock import MagicMock
 from starlette.testclient import TestClient
 
 from hermes_mcp.config import Config
-from hermes_mcp.server import build_app
+from hermes_mcp.server import build_app, build_http_app
 
 VALID_ENV: dict[str, str] = {
     "OAUTH_CLIENT_ID": "hermes-mcp-itest",
@@ -28,6 +31,7 @@ VALID_ENV: dict[str, str] = {
     "HERMES_API_KEY": "k" * 32,
 }
 BEARER_TOKEN = "b" * 48
+REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
 
 
 def _build_client(env: dict[str, str] | None = None) -> TestClient:
@@ -35,7 +39,7 @@ def _build_client(env: dict[str, str] | None = None) -> TestClient:
     hermes = MagicMock()
     hermes.ask.return_value = "alive"
     mcp = build_app(cfg, hermes)
-    return TestClient(mcp.streamable_http_app(), base_url="http://localhost:8765")
+    return TestClient(build_http_app(mcp, cfg), base_url="http://localhost:8765")
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -99,7 +103,7 @@ def _authorize(c: TestClient, challenge: str) -> str:
             "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-            "redirect_uri": "https://example.com/cb",
+            "redirect_uri": REDIRECT_URI,
             "state": "s",
         },
         follow_redirects=False,
@@ -129,75 +133,190 @@ def _initialize(c: TestClient, access_token: str) -> int:
     ).status_code
 
 
+def _exchange_code(
+    c: TestClient, code: str, verifier: str, client_secret: str | None
+) -> tuple[int, dict[str, object]]:
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
+        "code_verifier": verifier,
+    }
+    if client_secret is not None:
+        data["client_secret"] = client_secret
+    r = c.post("/token", data=data)
+    return r.status_code, r.json()
+
+
+def _refresh(
+    c: TestClient, refresh_token: str, client_secret: str | None
+) -> tuple[int, dict[str, object]]:
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
+    }
+    if client_secret is not None:
+        data["client_secret"] = client_secret
+    r = c.post("/token", data=data)
+    return r.status_code, r.json()
+
+
 def test_full_oauth_round_trip_then_mcp_initialize_claude_style() -> None:
-    """Claude Desktop's flow: paste both client_id and client_secret in the
-    connector UI, so its /token request includes a client_secret. The server
-    accepts the request (PKCE is the real gate; the secret is ignored)."""
+    """Claude's flow: client_id + client_secret pasted in the connector UI,
+    sent as `client_secret` in the /token form (client_secret_post), plus
+    PKCE. The server accepts it and the minted token works at /mcp."""
     verifier, challenge = _pkce_pair()
     with _build_client() as c:
         code = _authorize(c, challenge)
+        status, body = _exchange_code(c, code, verifier, VALID_ENV["OAUTH_CLIENT_SECRET"])
+        assert status == 200, body
+        assert _initialize(c, str(body["access_token"])) == 200
+
+
+def test_token_exchange_with_client_id_only_rejected() -> None:
+    """The verified hole: anyone who knows the tunnel URL and the (non-secret)
+    client_id could run /authorize (auto-approved) with their own PKCE pair
+    and exchange the code without a client_secret. The confidential client
+    must now refuse that with 401 and mint nothing — PKCE alone is not
+    authentication."""
+    verifier, challenge = _pkce_pair()
+    with _build_client() as c:
+        code = _authorize(c, challenge)
+        status, body = _exchange_code(c, code, verifier, client_secret=None)
+        assert status == 401, body
+        assert body["error"] == "unauthorized_client"
+        assert "access_token" not in body
+
+
+def test_token_exchange_with_wrong_client_secret_rejected() -> None:
+    verifier, challenge = _pkce_pair()
+    with _build_client() as c:
+        code = _authorize(c, challenge)
+        status, body = _exchange_code(c, code, verifier, client_secret="wrong-" + "x" * 42)
+        assert status == 401, body
+        assert "access_token" not in body
+
+
+def test_token_exchange_with_empty_client_secret_rejected() -> None:
+    verifier, challenge = _pkce_pair()
+    with _build_client() as c:
+        code = _authorize(c, challenge)
+        status, body = _exchange_code(c, code, verifier, client_secret="")
+        assert status == 401, body
+
+
+def test_token_exchange_with_secret_only_in_basic_header_rejected() -> None:
+    """Only client_secret_post is supported (and advertised). A secret sent
+    solely via HTTP Basic is not read, so the request is unauthenticated."""
+    verifier, challenge = _pkce_pair()
+    with _build_client() as c:
+        code = _authorize(c, challenge)
+        creds = f"{VALID_ENV['OAUTH_CLIENT_ID']}:{VALID_ENV['OAUTH_CLIENT_SECRET']}"
         r = c.post(
             "/token",
             data={
                 "grant_type": "authorization_code",
                 "code": code,
-                "redirect_uri": "https://example.com/cb",
+                "redirect_uri": REDIRECT_URI,
                 "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
-                "client_secret": VALID_ENV["OAUTH_CLIENT_SECRET"],
                 "code_verifier": verifier,
             },
+            headers={"Authorization": "Basic " + base64.b64encode(creds.encode()).decode()},
         )
-        assert r.status_code == 200, r.text
-        access_token = r.json()["access_token"]
-        assert _initialize(c, access_token) == 200
+        assert r.status_code == 401, r.text
 
 
-def test_full_oauth_round_trip_codex_style_no_client_secret() -> None:
-    """Codex CLI / Cursor flow: their MCP OAuth config has no client_secret
-    field (verified empirically in codex-rs/config/src/mcp_types.rs:120-124),
-    so their /token request omits client_secret entirely. PKCE alone must be
-    sufficient for the exchange to succeed — this is the headline contract
-    of the public-client change."""
+def test_refresh_requires_client_secret() -> None:
+    """The secret is enforced on the refresh_token grant too, so a leaked
+    refresh token alone can't be used to mint new access tokens."""
     verifier, challenge = _pkce_pair()
     with _build_client() as c:
         code = _authorize(c, challenge)
-        r = c.post(
-            "/token",
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": "https://example.com/cb",
-                "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
-                # NO client_secret
-                "code_verifier": verifier,
-            },
-        )
-        assert r.status_code == 200, r.text
-        access_token = r.json()["access_token"]
-        assert _initialize(c, access_token) == 200
+        status, body = _exchange_code(c, code, verifier, VALID_ENV["OAUTH_CLIENT_SECRET"])
+        assert status == 200, body
+        refresh_token = str(body["refresh_token"])
+
+        status, body = _refresh(c, refresh_token, client_secret=None)
+        assert status == 401, body
+        assert "access_token" not in body
+
+        status, body = _refresh(c, refresh_token, client_secret="wrong-" + "x" * 42)
+        assert status == 401, body
+
+        # The rejected attempts didn't consume the refresh token; the real
+        # client can still rotate it.
+        status, body = _refresh(c, refresh_token, VALID_ENV["OAUTH_CLIENT_SECRET"])
+        assert status == 200, body
+        assert _initialize(c, str(body["access_token"])) == 200
 
 
-def test_token_endpoint_ignores_wrong_client_secret_when_pkce_valid() -> None:
-    """Since the bridge is a public client (token_endpoint_auth_method=none,
-    client_secret=None on the registered client), the SDK no longer checks
-    any client_secret value in the form — even an obviously-wrong one is
-    accepted as long as PKCE is valid. Documents the new contract so a
-    future refactor doesn't accidentally reintroduce secret enforcement."""
-    verifier, challenge = _pkce_pair()
+def test_authorize_rejects_unpinned_redirect_uri_without_redirecting() -> None:
+    """/authorize must not be an open redirector: an unpinned redirect_uri
+    gets a direct 400 and no Location header, so no code (and no browser)
+    is ever sent to it."""
+    _verifier, challenge = _pkce_pair()
     with _build_client() as c:
-        code = _authorize(c, challenge)
-        r = c.post(
-            "/token",
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": "https://example.com/cb",
-                "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
-                "client_secret": "wrong-secret",
-                "code_verifier": verifier,
-            },
+        for evil in (
+            "https://attacker.example/cb",
+            "https://claude.ai.attacker.example/api/mcp/auth_callback",
+            "https://claude.ai/api/mcp/auth_callback/x",
+            "javascript:alert(1)",
+        ):
+            r = c.get(
+                "/authorize",
+                params={
+                    "response_type": "code",
+                    "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                    "redirect_uri": evil,
+                    "state": "s",
+                },
+                follow_redirects=False,
+            )
+            assert r.status_code == 400, (evil, r.status_code, r.text)
+            assert "location" not in r.headers, evil
+            assert "code=" not in r.text
+
+
+def test_authorize_accepts_configured_redirect_uri() -> None:
+    """OAUTH_ALLOWED_REDIRECT_URIS replaces the default list end-to-end."""
+    _verifier, challenge = _pkce_pair()
+    env = {**VALID_ENV, "OAUTH_ALLOWED_REDIRECT_URIS": "https://app.example.com/cb"}
+    with _build_client(env) as c:
+        params = {
+            "response_type": "code",
+            "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "s",
+        }
+        r = c.get(
+            "/authorize",
+            params={**params, "redirect_uri": "https://app.example.com/cb"},
+            follow_redirects=False,
         )
-        assert r.status_code == 200, r.text
+        assert r.status_code == 302, r.text
+        assert r.headers["location"].startswith("https://app.example.com/cb?")
+        r = c.get(
+            "/authorize",
+            params={**params, "redirect_uri": REDIRECT_URI},
+            follow_redirects=False,
+        )
+        assert r.status_code == 400
+
+
+def test_metadata_advertises_only_client_secret_post() -> None:
+    with _build_client() as c:
+        r = c.get("/.well-known/oauth-authorization-server")
+        assert r.status_code == 200
+        meta = r.json()
+        assert meta["token_endpoint_auth_methods_supported"] == ["client_secret_post"]
+        assert meta["code_challenge_methods_supported"] == ["S256"]
+        assert meta["token_endpoint"] == "http://localhost:8765/token"
+        assert "registration_endpoint" not in meta
 
 
 def test_token_endpoint_rejects_wrong_pkce_verifier() -> None:
@@ -210,7 +329,7 @@ def test_token_endpoint_rejects_wrong_pkce_verifier() -> None:
                 "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
-                "redirect_uri": "https://example.com/cb",
+                "redirect_uri": REDIRECT_URI,
                 "state": "s",
             },
             follow_redirects=False,
@@ -222,7 +341,7 @@ def test_token_endpoint_rejects_wrong_pkce_verifier() -> None:
             data={
                 "grant_type": "authorization_code",
                 "code": code,
-                "redirect_uri": "https://example.com/cb",
+                "redirect_uri": REDIRECT_URI,
                 "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
                 "client_secret": VALID_ENV["OAUTH_CLIENT_SECRET"],
                 "code_verifier": "wrong-verifier-doesnt-match-challenge",
@@ -260,19 +379,18 @@ def test_oauth_flow_still_works_when_bearer_configured() -> None:
     verifier, challenge = _pkce_pair()
     with _build_client({**VALID_ENV, "MCP_BEARER_TOKEN": BEARER_TOKEN}) as c:
         code = _authorize(c, challenge)
-        r = c.post(
-            "/token",
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": "https://example.com/cb",
-                "client_id": VALID_ENV["OAUTH_CLIENT_ID"],
-                "code_verifier": verifier,
-            },
-        )
-        assert r.status_code == 200, r.text
-        access_token = r.json()["access_token"]
-        assert _initialize(c, access_token) == 200
+        status, body = _exchange_code(c, code, verifier, VALID_ENV["OAUTH_CLIENT_SECRET"])
+        assert status == 200, body
+        assert _initialize(c, str(body["access_token"])) == 200
+
+
+def test_bearer_token_is_not_accepted_as_oauth_client_secret() -> None:
+    """MCP_BEARER_TOKEN and OAUTH_CLIENT_SECRET are separate credentials."""
+    verifier, challenge = _pkce_pair()
+    with _build_client({**VALID_ENV, "MCP_BEARER_TOKEN": BEARER_TOKEN}) as c:
+        code = _authorize(c, challenge)
+        status, _body = _exchange_code(c, code, verifier, client_secret=BEARER_TOKEN)
+        assert status == 401
 
 
 def test_register_endpoint_not_mounted_when_dcr_disabled() -> None:

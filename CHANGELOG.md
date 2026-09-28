@@ -21,32 +21,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Cursor.
 
 ### Changed
-- **Server is now a public OAuth client (PKCE-only).** The registered
-  client uses `token_endpoint_auth_method="none"` and `client_secret=None`,
-  so the SDK no longer validates `client_secret` at `/token` — PKCE is the
-  enforcing gate (mandatory `code_verifier` check at every authorization
-  code exchange). This unblocks Codex CLI and Cursor: their MCP OAuth
-  config schemas only carry `client_id` (no `client_secret` field exists),
-  and they were unable to complete the exchange against the previous
-  confidential-client setup.
-- Existing Claude Desktop / Claude.ai connector setups continue to work
-  with **no config change required**. Claude still pastes the
-  `client_secret` in its UI and sends it in the `/token` form; the server
-  reads it and ignores it. The `OAUTH_CLIENT_SECRET` env var stays
-  required at startup so existing deployments are not forced to migrate
-  (and so Claude's connector form still has a value to send).
-- Tool description for the no-longer-implemented `/register` endpoint now
-  mentions that only `OAUTH_CLIENT_ID` is needed for Codex/Cursor-style
-  clients; `OAUTH_CLIENT_SECRET` is only meaningful for Claude.
+- **Redirect URIs are pinned to an exact allowlist.** `/authorize` now only
+  redirects to URIs listed in the new `OAUTH_ALLOWED_REDIRECT_URIS`
+  (comma-separated; each must be `https://` or loopback `http://`; default
+  `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback`).
+  Anything else gets a 400 with no redirect. Previously any `https` URL was
+  accepted, which made `/authorize` an open redirector.
+- **`OAUTH_ALLOWED_REDIRECT_SCHEMES` is deprecated and ignored.** If it is
+  still set the server starts normally and logs a deprecation warning.
+  Clients with a non-Claude callback must be listed in
+  `OAUTH_ALLOWED_REDIRECT_URIS` instead.
+- **Auth-code cap evicts instead of refusing.** When
+  `MAX_OUTSTANDING_AUTH_CODES` is reached, `/authorize` evicts the oldest
+  outstanding code rather than returning `server_error`, so an
+  `/authorize` flood can't lock the real user out.
+- **Authorization-server metadata advertises only `client_secret_post`.**
+  The SDK default also lists `client_secret_basic`, which the static client
+  does not accept; a client that picked it would have failed to log in.
+- `Config` and `StaticClientProvider` no longer include
+  `OAUTH_CLIENT_SECRET`, `HERMES_API_KEY` or `MCP_BEARER_TOKEN` in their
+  `repr()`.
+- `mcp` dependency pinned to `>=1.2.0,<2`. mcp 2.x renamed `FastMCP` and
+  changed the auth APIs; an unpinned install now resolves to 2.x and the
+  server fails to import.
+- Codex (desktop and CLI) and Cursor connect via `MCP_BEARER_TOKEN`: their
+  MCP OAuth configs only support public (PKCE-only) clients, which this
+  server does not accept.
 
 ### Security
-- **Threat-model delta**: the access gate is now (a) knowing the issuer
-  URL, (b) knowing a valid `client_id`, and (c) completing the PKCE
-  challenge. The `client_secret` is no longer a gate. PKCE was designed
-  by RFC 7636 specifically to obviate `client_secret` for public clients,
-  so this matches every mobile / SPA OAuth deployment. The auto-approving
-  `/authorize` endpoint and the redirect-URI scheme allowlist remain the
-  defense against open-redirector abuse.
+- **Reverted the PKCE-only public-client change (never released).** An
+  unreleased commit on this line registered the static OAuth client with
+  `client_secret=None` / `token_endpoint_auth_method="none"`. Combined with
+  the auto-approving `/authorize`, that let anyone who knew the tunnel URL
+  and the (non-secret) `client_id` run the flow with their own PKCE
+  verifier and mint a working access token. The client is confidential
+  again (`client_secret_post`): the MCP SDK's `ClientAuthenticator` rejects
+  any `/token` request, for the authorization-code **and** refresh-token
+  grants, whose `client_secret` is missing or wrong (401). PKCE-S256 stays
+  mandatory on top. `OAUTH_CLIENT_SECRET` is a real credential; treat and
+  rotate it like one. Deployments that ran the public-client build should
+  rotate `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` if the tunnel URL may
+  have been seen by others, and check the journal for unexpected
+  `POST /token` 200s.
 
 ## [0.4.0] - 2026-05-17
 
