@@ -1,28 +1,31 @@
 """Single-user OAuth 2.1 authorization server provider.
 
-The MCP transport spec (and most MCP client UIs that add a remote server,
-including Claude Desktop's Custom Connector, Codex CLI, and Cursor) require
-an OAuth 2.1 authorization server in front of the MCP endpoint. For a
-personal bridge there is exactly one client and exactly one user, so this
-provider:
+The MCP transport spec (and Claude Desktop / Claude.ai's Custom Connector
+UI) requires an OAuth 2.1 authorization server in front of the MCP
+endpoint. For a personal bridge there is exactly one client and exactly one
+user, so this provider:
 
-  - holds a single static `client_id`, configured via env
-  - registers the client as a **public client** with
-    `token_endpoint_auth_method="none"` (no `client_secret`). PKCE is
-    mandatory; the SDK enforces it on every authorization-code exchange
-    (`mcp/server/auth/handlers/token.py:174-185`). Without PKCE the request
-    is rejected with `invalid_grant`, so the dynamic per-exchange
-    `code_verifier` is what actually protects token issuance.
+  - holds a single static `client_id` / `client_secret`, configured via env
+  - registers the client as a **confidential client** with
+    `token_endpoint_auth_method="client_secret_post"`. The SDK's
+    `ClientAuthenticator` rejects any /token request (authorization-code
+    AND refresh-token grants) whose `client_secret` form field is missing
+    or does not match (constant-time compare). PKCE-S256 is also mandatory.
+  - pins redirect URIs to an exact allowlist (default: Claude's connector
+    callbacks), so `/authorize` is not an open redirector and a code can
+    only ever be delivered to a configured client
   - auto-approves the /authorize step
   - mints opaque random access and refresh tokens, stored in memory
   - has no persistence: tokens evaporate on restart, the client just re-auths
 
-`OAUTH_CLIENT_SECRET` is still required at startup for backward
-compatibility (Claude Desktop / Claude.ai have it pasted in their connector
-UI and will keep sending it). The server simply ignores the value at the
-/token exchange — PKCE is the real gate. Codex CLI and Cursor, which only
-support PKCE-style public clients (`McpServerOAuthConfig` has no
-`client_secret` field), now work without changes.
+Why confidential and not PKCE-only (as the unreleased public-client change
+after v0.4.0 briefly was): PKCE binds a code to the client that started the
+flow, but it does not *authenticate* that client. With an auto-approving
+/authorize, a PKCE-only public client lets anyone who knows the tunnel URL
+and the (non-secret) `client_id` run the flow with their own verifier and
+mint a working token with curl. The 256-bit `client_secret` has to be the
+gate. MCP clients that only support public PKCE clients (Codex, Cursor) use
+the static bearer-token path (`MCP_BEARER_TOKEN`) instead.
 
 Dynamic Client Registration is intentionally disabled. Anyone hitting
 /register is told it is unsupported.
@@ -38,13 +41,13 @@ import hmac
 import logging
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Final
 
 from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
     AuthorizationParams,
-    AuthorizeError,
     OAuthAuthorizationServerProvider,
     RefreshToken,
     TokenError,
@@ -67,42 +70,39 @@ AUTHORIZATION_CODE_TTL = 60  # 1 minute (RFC 6749 §4.1.2 recommends short)
 MAX_OUTSTANDING_AUTH_CODES = 1024
 MAX_OUTSTANDING_ACCESS_TOKENS = 4096
 
-# Redirect-URI schemes the bridge ALWAYS accepts as a security baseline.
-# `https` is the standard for hosted MCP clients; `http` is only honored
-# for localhost (enforced below) so testing and the doctor flow work.
-# These are the schemes that cannot turn `/authorize` into an open
-# redirector to dangerous targets.
-_BASELINE_SCHEMES: frozenset[str] = frozenset({"https", "http"})
+# The only /token client-authentication method the static client accepts.
+# `server.build_http_app` advertises exactly this in the authorization-server
+# metadata so compliant clients don't pick `client_secret_basic`.
+TOKEN_ENDPOINT_AUTH_METHOD: Final = "client_secret_post"  # noqa: S105 — RFC 7591 method name, not a secret
 
-# Default custom URI schemes the bridge accepts on top of the baseline. Each
-# entry corresponds to an MCP client's OAuth redirect-URI scheme. Operators
-# extend or override this via `OAUTH_ALLOWED_REDIRECT_SCHEMES` for additional
-# clients (e.g. `vscode` for Continue). Re-exported from `config.py` so the
-# server default and the env-var default cannot drift apart.
-DEFAULT_ALLOWED_REDIRECT_SCHEMES: frozenset[str] = frozenset({"claude", "claudeai", "cursor"})
+# Exact redirect URIs `/authorize` will send a code to. Pinning them (rather
+# than allowing any https URL) means /authorize can't be used as an open
+# redirector, and a code can only ever be delivered to Claude. Operators add
+# URIs for other clients via OAUTH_ALLOWED_REDIRECT_URIS. Re-exported from
+# config.py so the env default and the provider default can't drift.
+DEFAULT_ALLOWED_REDIRECT_URIS: frozenset[str] = frozenset(
+    {
+        "https://claude.ai/api/mcp/auth_callback",
+        "https://claude.com/api/mcp/auth_callback",
+    }
+)
 
 
-def _check_redirect_uri(redirect_uri: AnyUrl, allowed_schemes: frozenset[str]) -> None:
-    """Reject schemes/hosts that would turn the OAuth flow into an open
-    redirector to dangerous targets.
+def normalize_redirect_uri(uri: str) -> str:
+    """Canonical string form used for exact-match comparison.
 
-    `allowed_schemes` is the union of the baseline (`https`, `http`-on-
-    localhost) and any custom URI schemes the operator configured via
-    `OAUTH_ALLOWED_REDIRECT_SCHEMES`. Each MCP client uses its own custom
-    scheme (`claude`, `claudeai`, `cursor`, `vscode`, ...); the operator
-    adds to the configured list as needed for new clients.
-
-    Permissive within sane bounds — we do not pin specific callback URIs
-    because they are subject to change without notice across client
-    versions. PKCE protects the actual token exchange (mandatory
-    code_verifier check at /token); this scheme check just prevents
-    `javascript:` / `data:` / `file:` style open-redirector abuse.
+    Pydantic's `AnyUrl` normalizes (lower-cases the host, adds a trailing
+    `/` to an empty path, ...). The SDK hands us the requested redirect_uri
+    as an `AnyUrl`, so configured entries are run through the same
+    normalization before comparing.
     """
-    scheme = (redirect_uri.scheme or "").lower()
-    if scheme not in allowed_schemes:
-        raise InvalidRedirectUriError(f"redirect_uri scheme {scheme!r} is not allowed")
-    if scheme == "http" and redirect_uri.host not in ("localhost", "127.0.0.1", "::1"):
-        raise InvalidRedirectUriError("redirect_uri scheme 'http' is only allowed for localhost")
+    return str(AnyUrl(uri))
+
+
+def _check_redirect_uri(redirect_uri: AnyUrl, allowed: frozenset[str]) -> None:
+    """Accept only an exact, pre-configured redirect URI."""
+    if str(redirect_uri) not in allowed:
+        raise InvalidRedirectUriError("redirect_uri is not allowed for this client")
 
 
 def _safe_state(state: str | None) -> str:
@@ -116,33 +116,20 @@ def _safe_state(state: str | None) -> str:
 
 
 class _StaticClient(OAuthClientInformationFull):
-    """Single static client. Accepts any redirect_uri sent by the client,
-    subject to a scheme allowlist enforced by `_check_redirect_uri`.
+    """Single static client whose redirect URIs are an exact allowlist
+    (`_allowed_redirect_uris`, a Pydantic `PrivateAttr` so it never appears
+    in the serialized model).
 
-    Validating the redirect_uri against a *pre-registered list* is not
-    useful here: PKCE binds the authorization code to the original
-    code_challenge, so an attacker who substitutes a redirect_uri cannot
-    exchange the code without the matching code_verifier (which never
-    leaves the legitimate client).
-
-    Validating the redirect_uri's *scheme* is, however, useful: without it
-    `/authorize` would happily redirect to `javascript:` or `data:` URIs
-    on request, turning the endpoint into an open redirector.
-
-    `_allowed_redirect_schemes` is the union of the baseline (`https`,
-    `http`-on-localhost) and the operator-configured custom schemes
-    (defaulting to `claude`, `claudeai`, `cursor`). Operators extend the
-    list via `OAUTH_ALLOWED_REDIRECT_SCHEMES` for new MCP clients.
-    Stored as a Pydantic `PrivateAttr` so it does not appear in the
-    serialized model and isn't passed across the wire.
+    A request whose redirect_uri is not on the list is rejected by the SDK's
+    /authorize handler with a direct 400 — it never redirects to it.
     """
 
-    _allowed_redirect_schemes: frozenset[str] = PrivateAttr(default_factory=frozenset)
+    _allowed_redirect_uris: frozenset[str] = PrivateAttr(default_factory=frozenset)
 
     def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
         if redirect_uri is None:
             raise InvalidRedirectUriError("redirect_uri is required")
-        _check_redirect_uri(redirect_uri, self._allowed_redirect_schemes)
+        _check_redirect_uri(redirect_uri, self._allowed_redirect_uris)
         return redirect_uri
 
 
@@ -150,51 +137,46 @@ class _StaticClient(OAuthClientInformationFull):
 class StaticClientProvider(
     OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
 ):
-    """In-memory OAuth provider for a single pre-shared client.
+    """In-memory OAuth provider for a single pre-shared confidential client.
 
     Optionally also accepts a static `bearer_token` as an alternative auth
-    method, for MCP clients (Codex desktop's custom-MCP form, Cursor's
-    `headers` block) whose UI has no OAuth flow at all. Both auth paths
-    coexist: each /mcp request is checked against (a) OAuth-issued access
-    tokens, then (b) the configured bearer token. Constant-time comparison
-    via `hmac.compare_digest`.
+    method, for MCP clients (Codex, Cursor's `headers` block) that only
+    support public OAuth clients or have no OAuth flow at all. Both auth
+    paths coexist: each /mcp request is checked against (a) OAuth-issued
+    access tokens, then (b) the configured bearer token. Constant-time
+    comparison via `hmac.compare_digest`.
+
+    `client_secret` and `bearer_token` are excluded from `repr()` so a stray
+    `logger.debug(provider)` cannot leak them.
     """
 
     client_id: str
-    client_secret: str
-    bearer_token: str | None = None
-    allowed_redirect_schemes: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_SCHEMES
+    client_secret: str = field(repr=False)
+    bearer_token: str | None = field(default=None, repr=False)
+    allowed_redirect_uris: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_URIS
     access_token_ttl: int = DEFAULT_ACCESS_TOKEN_TTL
     refresh_token_ttl: int = DEFAULT_REFRESH_TOKEN_TTL
 
     def __post_init__(self) -> None:
-        # `self.client_secret` is kept required at construction time for
-        # backward-compat with deployments that already have OAUTH_CLIENT_SECRET
-        # set, and because Claude Desktop's UI still requires a value to paste.
-        # It is NOT used for auth — see the module docstring; PKCE is the gate.
         if not self.client_id or not self.client_secret:
             raise ValueError("client_id and client_secret are required")
-        # Baseline (`https`, `http`-on-localhost) is always allowed alongside
-        # the operator-configured custom schemes — see _check_redirect_uri.
-        effective_schemes = _BASELINE_SCHEMES | frozenset(
-            s.lower() for s in self.allowed_redirect_schemes
-        )
-        # Public client (PKCE-only). `client_secret=None` + auth method `"none"`
-        # makes the SDK skip the secret check at /token (`client_auth.py:93-104`),
-        # while PKCE remains mandatory (`token.py:26, 174-185`). This is what
-        # lets Codex CLI / Cursor — which only ship `client_id` in their MCP
-        # config — complete the OAuth flow. Claude Desktop still pastes a
-        # client_secret in its UI; the server reads it but doesn't enforce it.
+        allowed = frozenset(normalize_redirect_uri(u) for u in self.allowed_redirect_uris)
+        if not allowed:
+            raise ValueError("at least one allowed redirect URI is required")
+        self.allowed_redirect_uris = allowed
+        # Confidential client: the SDK's ClientAuthenticator
+        # (`mcp/server/auth/middleware/client_auth.py`) enforces the secret on
+        # every /token request, on top of mandatory PKCE.
         self._client = _StaticClient(
             client_id=self.client_id,
-            client_secret=None,
-            redirect_uris=[AnyUrl("http://localhost/")],  # placeholder; we override validation
+            client_secret=self.client_secret,
+            redirect_uris=[AnyUrl(u) for u in sorted(allowed)],
             grant_types=["authorization_code", "refresh_token"],
             response_types=["code"],
-            token_endpoint_auth_method="none",  # noqa: S106 — RFC 7591 method name, not a secret
+            token_endpoint_auth_method=TOKEN_ENDPOINT_AUTH_METHOD,
         )
         # PrivateAttr can't be set via constructor in Pydantic v2; assign here.
-        self._client._allowed_redirect_schemes = effective_schemes
+        self._client._allowed_redirect_uris = allowed
         self._auth_codes: dict[str, AuthorizationCode] = {}
         self._access_tokens: dict[str, AccessToken] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
@@ -207,6 +189,8 @@ class StaticClientProvider(
         # One-time audit log marker so the first bearer-auth event surfaces
         # at INFO without spamming every subsequent request.
         self._bearer_logged: bool = False
+        # One-time marker for the outstanding-code-cap warning.
+        self._cap_warned: bool = False
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         if hmac.compare_digest(client_id.encode(), self.client_id.encode()):
@@ -216,9 +200,9 @@ class StaticClientProvider(
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         raise NotImplementedError(
             "Dynamic client registration is disabled. Configure OAUTH_CLIENT_ID "
-            "on the server and paste it into your MCP client's OAuth config. "
-            "Claude Desktop also requires OAUTH_CLIENT_SECRET in its connector UI "
-            "(the server accepts but does not enforce it; PKCE is the real gate)."
+            "and OAUTH_CLIENT_SECRET on the server and paste both into your MCP "
+            "client's connector config (clients without client_secret support "
+            "should use MCP_BEARER_TOKEN instead)."
         )
 
     async def authorize(
@@ -227,12 +211,20 @@ class StaticClientProvider(
         # Reap expired codes opportunistically so `/authorize` is the only
         # write path that grows the dict.
         self._reap_expired_codes()
-        if len(self._auth_codes) >= MAX_OUTSTANDING_AUTH_CODES:
-            logger.warning(
-                "oauth: refusing /authorize — outstanding-code cap reached (%d)",
-                MAX_OUTSTANDING_AUTH_CODES,
-            )
-            raise AuthorizeError("server_error", "Too many outstanding authorization codes")
+        while len(self._auth_codes) >= MAX_OUTSTANDING_AUTH_CODES:
+            # Evict the oldest instead of refusing: anyone who knows the
+            # client_id can call /authorize, and refusing would let a flood
+            # lock the real user out. A legitimate code is exchanged within
+            # about a second, so it's always among the newest. Dicts preserve
+            # insertion order, so the first key is the oldest.
+            oldest = next(iter(self._auth_codes))
+            del self._auth_codes[oldest]
+            if not self._cap_warned:
+                logger.warning(
+                    "oauth: outstanding-code cap (%d) reached; evicting oldest codes",
+                    MAX_OUTSTANDING_AUTH_CODES,
+                )
+                self._cap_warned = True
 
         # Auto-approve: mint a code and immediately redirect back to the client.
         code = secrets.token_urlsafe(32)

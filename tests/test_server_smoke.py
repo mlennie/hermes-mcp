@@ -100,25 +100,33 @@ def test_allowed_hosts_origins_handle_scheme_prefix() -> None:
     assert "https://https://other.example.com" not in origins
 
 
-def test_oauth_allowed_schemes_propagate_from_env_to_validation() -> None:
-    """End-to-end wiring check: `OAUTH_ALLOWED_REDIRECT_SCHEMES` set on the
-    env reaches `_StaticClient.validate_redirect_uri` through Config →
-    build_app → StaticClientProvider → _StaticClient. The two unit tests in
+def test_oauth_allowed_redirect_uris_propagate_from_env_to_validation() -> None:
+    """End-to-end wiring check: `OAUTH_ALLOWED_REDIRECT_URIS` set on the env
+    reaches `_StaticClient.validate_redirect_uri` through Config →
+    build_app → StaticClientProvider → _StaticClient. The unit tests in
     test_config.py and test_oauth.py cover the parts in isolation; this
     catches a regression that breaks the wiring between them."""
-    cfg = Config.from_env({**VALID_ENV, "OAUTH_ALLOWED_REDIRECT_SCHEMES": "vscode"})
+    cfg = Config.from_env(
+        {**VALID_ENV, "OAUTH_ALLOWED_REDIRECT_URIS": "https://app.example.com/cb"}
+    )
     mcp = build_app(cfg, MagicMock())
     provider = mcp._auth_server_provider  # type: ignore[attr-defined]
     assert provider is not None
     client = provider._client  # type: ignore[attr-defined]
-    # Configured scheme works end-to-end.
-    assert client.validate_redirect_uri(AnyUrl("vscode://continue.continue/cb")) is not None
-    # Baseline survives even when default custom schemes are not configured.
+    # Configured URI works end-to-end.
     assert client.validate_redirect_uri(AnyUrl("https://app.example.com/cb")) is not None
-    # Default custom schemes are NOT accepted when the env var is set to
-    # something else — pins the "env var replaces, not extends" contract.
-    with pytest.raises(InvalidRedirectUriError, match="not allowed"):
-        client.validate_redirect_uri(AnyUrl("claude://oauth/cb"))
+    # Anything else — including the Claude default, once replaced — is refused.
+    for other in ("https://app.example.com/cb2", "https://claude.ai/api/mcp/auth_callback"):
+        with pytest.raises(InvalidRedirectUriError, match="not allowed"):
+            client.validate_redirect_uri(AnyUrl(other))
+
+
+def test_build_app_registers_confidential_client() -> None:
+    """The provider build_app wires in must enforce the client_secret."""
+    mcp = build_app(_config(), MagicMock())
+    client = mcp._auth_server_provider._client  # type: ignore[attr-defined]
+    assert client.client_secret == VALID_ENV["OAUTH_CLIENT_SECRET"]
+    assert client.token_endpoint_auth_method == "client_secret_post"
 
 
 def test_oauth_issuer_url_no_double_slash_in_resource_url() -> None:

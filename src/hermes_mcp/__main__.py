@@ -22,11 +22,16 @@ def _mint_client() -> int:
     print(f"OAUTH_CLIENT_ID={client_id}")
     print(f"OAUTH_CLIENT_SECRET={client_secret}")
     print()
-    print("# Then in your MCP client (Claude Desktop > Settings > Connectors,")
-    print("# Codex CLI's ~/.codex/config.toml, Cursor's ~/.cursor/mcp.json, ...):")
+    print("# Then in Claude (Settings > Connectors > Add custom connector >")
+    print("# Advanced settings), or any MCP client that supports a static")
+    print("# confidential OAuth client (client_id + client_secret):")
     print("#   URL:           https://<your-tunnel-host>/mcp")
     print(f"#   Client ID:     {client_id}")
     print(f"#   Client Secret: {client_secret}")
+    print("#")
+    print("# The client_secret is enforced at /token. Clients that only support")
+    print("# public (PKCE-only) OAuth clients, such as Codex and Cursor, cannot")
+    print("# use this; give them a bearer token instead: hermes-mcp mint-bearer-token")
     return 0
 
 
@@ -42,7 +47,8 @@ def _mint_bearer_token() -> int:
     print("#   - Anywhere that lets you set Authorization headers on the request.")
     print()
     print("# OAuth-based clients (Claude Desktop / Claude.ai) keep working unchanged;")
-    print("# the bearer token is an additional auth path, not a replacement.")
+    print("# the bearer token is an additional auth path, not a replacement. It is")
+    print("# the only way for public-client-only MCP clients (Codex, Cursor) to connect.")
     return 0
 
 

@@ -3,6 +3,9 @@
 All knobs documented in `.env.example`. The server refuses to start if any
 of OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, OAUTH_ISSUER_URL, or HERMES_API_KEY
 is missing.
+
+Secrets (OAUTH_CLIENT_SECRET, HERMES_API_KEY, MCP_BEARER_TOKEN) are excluded
+from `Config.__repr__` so a stray `logger.debug(config)` cannot leak them.
 """
 
 from __future__ import annotations
@@ -10,10 +13,12 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
+from urllib.parse import urlsplit
 
-from hermes_mcp.oauth import DEFAULT_ALLOWED_REDIRECT_SCHEMES as _DEFAULT_SCHEMES
+from hermes_mcp.oauth import DEFAULT_ALLOWED_REDIRECT_URIS as _DEFAULT_URIS
+from hermes_mcp.oauth import normalize_redirect_uri
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 _VALID_LOG_LEVELS: frozenset[str] = frozenset(("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
@@ -23,7 +28,23 @@ _VALID_LOG_LEVELS: frozenset[str] = frozenset(("DEBUG", "INFO", "WARNING", "ERRO
 # the re-export here gives `test_config` a stable name to assert against
 # and guarantees the env-var default and `StaticClientProvider` default
 # cannot drift apart.
-DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES: tuple[str, ...] = tuple(sorted(_DEFAULT_SCHEMES))
+DEFAULT_OAUTH_ALLOWED_REDIRECT_URIS: tuple[str, ...] = tuple(sorted(_DEFAULT_URIS))
+
+_LOOPBACK_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_allowed_redirect_uri_form(uri: str) -> bool:
+    """`https://...`, or `http://` to a loopback host (for local testing)."""
+    try:
+        parts = urlsplit(uri)
+        normalize_redirect_uri(uri)  # must also parse the way the provider will
+    except ValueError:  # includes pydantic.ValidationError
+        return False
+    if not parts.netloc:
+        return False
+    if parts.scheme == "https":
+        return True
+    return parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS
 
 
 class ConfigError(Exception):
@@ -33,22 +54,23 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class Config:
     oauth_client_id: str
-    oauth_client_secret: str
+    oauth_client_secret: str = field(repr=False)
     oauth_issuer_url: str
     hermes_api_url: str
-    hermes_api_key: str
+    hermes_api_key: str = field(repr=False)
     hermes_model: str
     hermes_request_timeout_seconds: int
     bind_host: str
     bind_port: int
     allowed_hosts: tuple[str, ...]
-    allowed_redirect_schemes: tuple[str, ...]
+    # Exact OAuth redirect URIs `/authorize` may send a code to.
+    allowed_redirect_uris: tuple[str, ...]
     # Optional static bearer token. When set, the server accepts
     # `Authorization: Bearer <token>` directly, in addition to OAuth-issued
-    # access tokens. Necessary for MCP clients whose UI only exposes static
-    # token fields (Codex desktop's custom-MCP form, Cursor's `headers`
-    # config) and have no OAuth flow.
-    mcp_bearer_token: str | None
+    # access tokens. Necessary for MCP clients that have no OAuth flow or
+    # only support public (PKCE-only) OAuth clients (Codex, Cursor's
+    # `headers` config), since the OAuth client here is confidential.
+    mcp_bearer_token: str | None = field(repr=False)
     log_level: LogLevel
 
     @classmethod
@@ -115,16 +137,31 @@ class Config:
         allowed_hosts_raw = (e.get("MCP_ALLOWED_HOSTS") or "").strip()
         allowed_hosts = tuple(h.strip() for h in allowed_hosts_raw.split(",") if h.strip())
 
-        # OAuth redirect-URI scheme allowlist. Each MCP client uses its own
-        # custom URI scheme for the OAuth redirect (Claude → claude/claudeai,
-        # Cursor → cursor, etc.). The default covers the clients we test
-        # against; operators add to it for new clients. Any input that
-        # parses to an empty list (whitespace-only, comma-only, etc.) falls
-        # back to the default so a typo can't silently disable every custom
-        # scheme.
-        schemes_raw = e.get("OAUTH_ALLOWED_REDIRECT_SCHEMES") or ""
-        parsed = tuple(s.strip().lower() for s in schemes_raw.split(",") if s.strip())
-        allowed_redirect_schemes = parsed or DEFAULT_OAUTH_ALLOWED_REDIRECT_SCHEMES
+        # Exact OAuth redirect URIs a code may be sent to. Default: Claude's
+        # connector callbacks. Each entry must be https:// (or http:// to a
+        # loopback host, for testing). An input that parses to an empty list
+        # (whitespace-only, comma-only, ...) falls back to the default so a
+        # typo can't lock everyone out.
+        uris_raw = e.get("OAUTH_ALLOWED_REDIRECT_URIS") or ""
+        uris = tuple(u.strip() for u in uris_raw.split(",") if u.strip())
+        for u in uris:
+            if not _is_allowed_redirect_uri_form(u):
+                raise ConfigError(
+                    "OAUTH_ALLOWED_REDIRECT_URIS entries must be https:// URLs "
+                    f"(or http://localhost for testing), got {u!r}"
+                )
+        allowed_redirect_uris = uris or DEFAULT_OAUTH_ALLOWED_REDIRECT_URIS
+
+        # Deprecated: the scheme-based allowlist was replaced by exact
+        # redirect-URI pinning. Still accepted (so an existing env file does
+        # not stop the server from starting) but ignored.
+        if (e.get("OAUTH_ALLOWED_REDIRECT_SCHEMES") or "").strip():
+            logging.getLogger(__name__).warning(
+                "OAUTH_ALLOWED_REDIRECT_SCHEMES is deprecated and ignored: redirect "
+                "URIs are now pinned exactly. Use OAUTH_ALLOWED_REDIRECT_URIS "
+                "(comma-separated https:// URLs) if you need callbacks other than "
+                "Claude's."
+            )
 
         # Static bearer token (optional). Coexists with OAuth: both auth
         # methods are accepted at /mcp. Mostly useful for clients that have
@@ -172,7 +209,7 @@ class Config:
             bind_host=bind_host,
             bind_port=port,
             allowed_hosts=allowed_hosts,
-            allowed_redirect_schemes=allowed_redirect_schemes,
+            allowed_redirect_uris=allowed_redirect_uris,
             mcp_bearer_token=mcp_bearer_token,
             log_level=log_level,
         )
