@@ -15,6 +15,7 @@ release / clean-slate).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -71,6 +72,11 @@ Args:
   prompt: Natural-language instruction for Hermes.
   session_id: Optional. Pass the same id across multiple calls in one chat
     to let Hermes remember prior steps (e.g. draft -> refine -> save).
+  profile: Optional. Which Hermes profile to send this request to. Only
+    profile names allowed by this server's HERMES_PROFILE_ROUTES
+    allowlist are accepted ("default" always means the base gateway);
+    an unknown name fails fast with a clear error instead of silently
+    going to the wrong agent. Omit for the default profile.
   toolsets: Optional. Restrict Hermes to specific toolsets for this call.
   async_mode: Optional. Default False. Decides whether `hermes_ask` blocks
     on the result or returns a job id immediately. Read this carefully —
@@ -229,6 +235,7 @@ def _run_job(
     prompt: str,
     session_id: str | None,
     toolsets: list[str] | None,
+    profile: str | None = None,
 ) -> None:
     """Background worker: invoke the gateway and stash the outcome.
 
@@ -238,7 +245,9 @@ def _run_job(
     """
     jobs.mark_running(job_id)
     try:
-        result = client.ask(prompt, session_id=session_id, toolsets=toolsets)
+        result = client.ask(
+            prompt, session_id=session_id, toolsets=toolsets, profile=profile
+        )
     except HermesError as exc:
         logger.info("async job %s failed: %s", job_id, exc)
         jobs.mark_failed(job_id, str(exc))
@@ -291,26 +300,40 @@ def build_app(
     job_store = jobs if jobs is not None else JobStore()
 
     @mcp.tool(description=_TOOL_DESCRIPTION)
-    def hermes_ask(
+    async def hermes_ask(
         prompt: str,
         session_id: str | None = None,
+        profile: str | None = None,
         toolsets: list[str] | None = None,
         async_mode: bool = False,
     ) -> str:
         # HermesError propagates; FastMCP wraps any Exception in ToolError.
         if not async_mode:
-            return client.ask(prompt, session_id=session_id, toolsets=toolsets)
+            # FastMCP executes sync tool handlers directly on the event loop
+            # (no thread offload), so a slow gateway call would block ALL
+            # requests — including unrelated sessions — for up to
+            # hermes_request_timeout_seconds. Offload to a worker thread.
+            return await asyncio.to_thread(
+                client.ask,
+                prompt,
+                session_id=session_id,
+                toolsets=toolsets,
+                profile=profile,
+            )
 
-        job = job_store.create(prompt_chars=len(prompt), session_id=session_id)
+        job = job_store.create(
+            prompt_chars=len(prompt), session_id=session_id, profile=profile
+        )
         logger.info(
-            "async job %s queued (prompt_chars=%d session=%s)",
+            "async job %s queued (prompt_chars=%d session=%s profile=%s)",
             job.job_id,
             len(prompt),
             "y" if session_id else "n",
+            profile or "default",
         )
         thread = threading.Thread(
             target=_run_job,
-            args=(client, job_store, job.job_id, prompt, session_id, toolsets),
+            args=(client, job_store, job.job_id, prompt, session_id, toolsets, profile),
             name=f"hermes-job-{job.job_id[:8]}",
             daemon=True,
         )

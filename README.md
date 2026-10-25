@@ -81,7 +81,8 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 | `MCP_ALLOWED_HOSTS` | no | (localhost only) | Comma-separated additional Host header values to accept (typically your public tunnel hostname). MCP uses this for DNS-rebinding protection. |
 | `BIND_HOST` | no | `127.0.0.1` | Bind address. The tunnel reaches it on localhost. **Do not** bind `0.0.0.0` unless you understand the implications. |
 | `BIND_PORT` | no | `8765` | Port. |
-| `HERMES_REQUEST_TIMEOUT_SECONDS` | no | `300` | Max wall-clock per `hermes_ask` call. |
+| `HERMES_REQUEST_TIMEOUT_SECONDS` | no | `300` | **Inactivity limit**: the longest `hermes_ask` waits for the next event (delta or `: keepalive`) from the gateway. Not a wall-clock limit — a turn that keeps streaming may run for hours. Must be positive. |
+| `HERMES_REQUEST_MAX_SECONDS` | no | `0` | Optional hard ceiling for one `hermes_ask` turn: a watchdog starts before the request and closes the stream at the deadline, the read budget is capped at it, and the setup budgets (connect/write/pool) are each capped at the same value. `0` (default) means no ceiling. With an artificially tiny value (< 1 s) a slow connection setup can overshoot it, since each setup phase gets its own budget. |
 | `OAUTH_ALLOWED_REDIRECT_URIS` | no | `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback` | Comma-separated list of the **exact** OAuth redirect URIs `/authorize` will send a code to. Each entry must be `https://` (or `http://localhost` / `127.0.0.1` / `[::1]` for testing). Setting it replaces the default, so keep Claude's callbacks in the list if you still use Claude. Any other `redirect_uri` gets a 400 with no redirect. |
 | `OAUTH_ALLOWED_REDIRECT_SCHEMES` | — | — | **Deprecated, ignored.** The old scheme-based allowlist (which accepted any `https` URL) was replaced by exact-URI pinning. If still set, the server starts normally and logs a deprecation warning. Remove it from your env file. |
 | `MCP_BEARER_TOKEN` | no | (unset) | Optional static bearer token (32+ chars). When set, the server accepts `Authorization: Bearer <token>` directly at `/mcp`, in addition to OAuth. **Required** for MCP clients that only support public (PKCE-only) OAuth clients or have no OAuth flow at all — Codex (desktop and CLI) and Cursor. Generate with `hermes-mcp mint-bearer-token`. |
@@ -144,7 +145,7 @@ Then restart `hermes-mcp`. Clients that can't send a `client_secret` (Codex, Cur
 
 The MCP server exposes four tools:
 
-### `hermes_ask(prompt, session_id?, toolsets?, async_mode?)`
+### `hermes_ask(prompt, session_id?, profile?, toolsets?, async_mode?)`
 
 Delegates a task to Hermes. Use it for anything the calling LLM cannot do directly:
 
@@ -158,6 +159,22 @@ Delegates a task to Hermes. Use it for anything the calling LLM cannot do direct
 Pass the same `session_id` across calls within one chat to let Hermes build on previous steps (draft → refine → save). It is forwarded as the `X-Hermes-Session-Id` header so Hermes threads the call into an existing session.
 
 The `toolsets` argument is accepted for backward compatibility but is currently ignored — toolset selection now lives in your Hermes config (`platform_toolsets.api_server`). Set it there to match the Telegram surface (typically `[hermes-telegram]`) so MCP clients get the same tools the Telegram path does.
+
+#### `profile` — multiple Hermes profiles from one bridge
+
+If the server is configured with `HERMES_PROFILE_ROUTES` (see [Configuration](#configuration)), `hermes_ask` accepts an optional `profile` argument that routes the request to that profile's own gateway endpoint — for example the `/p/<name>/` route of a Hermes multi-profile gateway. `session_id`, `async_mode`, and `hermes_check` work per call as usual; the profile only decides *where* the request lands.
+
+- `profile` omitted, `None`, or `"default"` → base `HERMES_API_URL` (unchanged behavior).
+- Any other name → must be listed in the server's `HERMES_PROFILE_ROUTES`; unknown names fail fast with a clear error (the list is the allowlist — nothing silently routes elsewhere).
+- Per-profile API keys via `HERMES_API_KEY_<NAME>` (`-` → `_` in the env var name); profiles without their own key fall back to the base `HERMES_API_KEY`.
+
+Example server config reaching two profiles of one gateway:
+
+```bash
+HERMES_PROFILE_ROUTES=mgr-plattform=http://127.0.0.1:8642/p/mgr-plattform,planer=http://127.0.0.1:8642/p/planer
+HERMES_API_KEY_MGR_PLATTFORM=...   # optional, else base key is used
+HERMES_API_KEY_PLANER=...
+```
 
 #### Async mode for long-running tasks
 

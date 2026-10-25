@@ -58,6 +58,9 @@ class Job:
     finished_at: float | None = None
     prompt_chars: int = 0
     session_id: str | None = None
+    # Optional profile routing: which gateway profile this job targets
+    # (from the HERMES_PROFILE_ROUTES allowlist). None = default profile.
+    profile: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serializable shape returned to the MCP client.
@@ -74,6 +77,8 @@ class Job:
         }
         if self.session_id is not None:
             d["session_id"] = self.session_id
+        if self.profile is not None:
+            d["profile"] = self.profile
         if self.finished_at is not None:
             d["finished_at"] = self.finished_at
         if self.result is not None:
@@ -97,7 +102,12 @@ class JobStore:
     _jobs: dict[str, Job] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def create(self, prompt_chars: int = 0, session_id: str | None = None) -> Job:
+    def create(
+        self,
+        prompt_chars: int = 0,
+        session_id: str | None = None,
+        profile: str | None = None,
+    ) -> Job:
         """Allocate a new pending job and return it."""
         now = time.time()
         with self._lock:
@@ -113,6 +123,7 @@ class JobStore:
                 created_at=now,
                 prompt_chars=prompt_chars,
                 session_id=session_id,
+                profile=profile,
             )
             self._jobs[job.job_id] = job
             return job

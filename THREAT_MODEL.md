@@ -97,7 +97,7 @@ Refresh tokens expire after 30 days.
 
 ### 6. Runaway tasks (gateway hang)
 
-`HERMES_REQUEST_TIMEOUT_SECONDS` (default 300) bounds each `httpx.post` to the gateway. A hung gateway turns into a `HermesError` after the timeout, which the MCP framework surfaces as a tool error to Claude. The bridge's other tool calls are unaffected (each `hermes_ask` runs in its own request handler).
+`HERMES_REQUEST_TIMEOUT_SECONDS` (default 300) bounds the **silence** between two gateway events (deltas or `: keepalive` lines) of one streaming `hermes_ask` call; a hung gateway turns into a `HermesError` after that much quiet. `HERMES_REQUEST_MAX_SECONDS` (default 0 = off) optionally adds a hard per-turn ceiling, checked between events. The bridge's other tool calls are unaffected (each `hermes_ask` runs in its own request handler).
 
 ### 7. Credential leakage via logs
 

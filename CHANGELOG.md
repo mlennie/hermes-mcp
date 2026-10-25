@@ -7,10 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`hermes_ask` no longer dies on a fixed wall-clock timeout.** The gateway
+  call now streams (`stream: true`) and the client bounds the **silence**
+  between two events instead of the total duration of the turn:
+  `HERMES_REQUEST_TIMEOUT_SECONDS` (default 300) is now the maximum time to
+  wait for the next delta or `: keepalive` line. Long agentic turns that keep
+  working therefore survive; genuinely hung gateways still fail. The error
+  message changed from `hermes gateway timed out after Ns` to
+  `hermes gateway sent no events for Ns`, and a connect-timeout is reported
+  separately (`could not be reached within …`).
+- New optional `HERMES_REQUEST_MAX_SECONDS` (default `0` = off): a hard
+  ceiling for one turn. A watchdog starts before the request and closes the
+  stream when the deadline passes, the read budget is capped at it, and so are
+  the connect/write/pool budgets — neither a silent phase, a chatty keepalive
+  stream nor a slow connection setup can carry the turn past the wall. `0`
+  means no ceiling (the default).
+- The answer is assembled from the SSE deltas (`choices[0].delta.content`);
+  `: keepalive` comment lines and `data: [DONE]` are handled and never leak
+  into the returned text.
+
 ### Added
+- **Optional per-profile routing for multi-profile gateways.** New env var
+  `HERMES_PROFILE_ROUTES` (comma-separated `name=url` entries) turns one
+  bridge into a single connector for several Hermes profiles: `hermes_ask`
+  gains an optional `profile` argument that routes the request to that
+  profile's endpoint (e.g. the `/p/<name>/` route of a Hermes multi-profile
+  gateway). The list is the allowlist — `default` always means the base
+  `HERMES_API_URL` (no entry needed), unknown names fail fast with a clear
+  error and never fall back silently. Per-profile keys via
+  `HERMES_API_KEY_<NAME>` (`-` becomes `_` in the env var name); profiles
+  without their own key use the base `HERMES_API_KEY`. Async jobs record
+  the requested profile in the job payload shown by `hermes_check`.
+  Deployments that don't set `HERMES_PROFILE_ROUTES` behave exactly as
+  before.
 - **Static bearer-token auth as an alternative to OAuth.** New optional
   env var `MCP_BEARER_TOKEN` (32+ chars). When set, the server accepts
-  `Authorization: Bearer <MCP_BEARER_TOKEN>` directly at /mcp, in
+  `Authorization: Bearer <MCP_B...EN>` directly at /mcp, in
   addition to OAuth-issued access tokens. Both methods coexist on the
   same instance — Claude / Claude.ai keep using OAuth; clients with no
   OAuth UI (Codex desktop's custom-MCP form, Cursor's `headers` block)

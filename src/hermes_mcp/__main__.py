@@ -103,6 +103,9 @@ def main(argv: list[str] | None = None) -> int:
         api_key=config.hermes_api_key,
         model=config.hermes_model,
         timeout_seconds=config.hermes_request_timeout_seconds,
+        max_seconds=config.hermes_request_max_seconds,
+        profile_routes=config.profile_routes,
+        profile_keys=config.profile_keys,
     )
 
     try:

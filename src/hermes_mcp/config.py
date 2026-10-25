@@ -60,6 +60,10 @@ class Config:
     hermes_api_key: str = field(repr=False)
     hermes_model: str
     hermes_request_timeout_seconds: int
+    # Hard ceiling for one agentic turn in seconds; 0 means "no ceiling".
+    # `hermes_request_timeout_seconds` above bounds the SILENCE between two
+    # gateway events, this bounds the whole turn for operators who want a wall.
+    hermes_request_max_seconds: int
     bind_host: str
     bind_port: int
     allowed_hosts: tuple[str, ...]
@@ -72,6 +76,16 @@ class Config:
     # `headers` config), since the OAuth client here is confidential.
     mcp_bearer_token: str | None = field(repr=False)
     log_level: LogLevel
+    # Optional per-profile routing table for multi-profile gateways
+    # (HERMES_PROFILE_ROUTES): maps a profile name to that profile's base
+    # gateway URL. `default` is always allowed and means the base
+    # HERMES_API_URL, so it does not need an entry. Mutable on purpose —
+    # Config instances are not hashed.
+    profile_routes: dict[str, str] = field(default_factory=dict)
+    # Optional per-profile API keys (HERMES_API_KEY_<PROFILE>, `-` in the
+    # profile name becomes `_` in the env var name). Falls back to
+    # HERMES_API_KEY for profiles without their own key.
+    profile_keys: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -134,6 +148,19 @@ class Config:
                 f"HERMES_REQUEST_TIMEOUT_SECONDS must be positive, got {request_timeout}"
             )
 
+        try:
+            request_max = int(e.get("HERMES_REQUEST_MAX_SECONDS", "0"))
+        except ValueError as exc:
+            raise ConfigError(
+                "HERMES_REQUEST_MAX_SECONDS must be an integer, got "
+                f"{e.get('HERMES_REQUEST_MAX_SECONDS')!r}"
+            ) from exc
+        if request_max < 0:
+            raise ConfigError(
+                "HERMES_REQUEST_MAX_SECONDS must be 0 (no ceiling) or positive, "
+                f"got {request_max}"
+            )
+
         allowed_hosts_raw = (e.get("MCP_ALLOWED_HOSTS") or "").strip()
         allowed_hosts = tuple(h.strip() for h in allowed_hosts_raw.split(",") if h.strip())
 
@@ -181,6 +208,76 @@ class Config:
         else:
             mcp_bearer_token = None
 
+        # Optional multi-profile routing (HERMES_PROFILE_ROUTES): a
+        # comma-separated list of `name=url` entries. Each name becomes an
+        # allowed `profile` value for `hermes_ask`, and its requests are
+        # routed to `<url>/v1/chat/completions` — this is how a single
+        # bridge reaches per-profile gateways (e.g. the /p/<name>/ routes
+        # of a Hermes multi-profile gateway). `default` is always allowed
+        # and means the base HERMES_API_URL; listing it is unnecessary.
+        profile_routes: dict[str, str] = {}
+        routes_raw = (e.get("HERMES_PROFILE_ROUTES") or "").strip()
+        if routes_raw:
+            for part in routes_raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "=" not in part:
+                    raise ConfigError(
+                        "HERMES_PROFILE_ROUTES entries must be name=url "
+                        f"(comma-separated), got {part!r}"
+                    )
+                name, url = part.split("=", 1)
+                name = name.strip().lower()
+                url = url.strip().rstrip("/")
+                if not name or not url:
+                    raise ConfigError(
+                        f"HERMES_PROFILE_ROUTES entry {part!r} has an empty name or url"
+                    )
+                if not (url.startswith("http://") or url.startswith("https://")):
+                    raise ConfigError(
+                        f"HERMES_PROFILE_ROUTES url for profile {name!r} must be "
+                        f"http:// or https://, got {url!r}"
+                    )
+                if name == "default":
+                    logging.getLogger(__name__).warning(
+                        "HERMES_PROFILE_ROUTES contains a 'default' entry; 'default' "
+                        "always means the base HERMES_API_URL and the entry is ignored."
+                    )
+                    continue
+                if name in profile_routes:
+                    raise ConfigError(
+                        f"HERMES_PROFILE_ROUTES has duplicate profile name {name!r}"
+                    )
+                profile_routes[name] = url
+
+        # Optional per-profile API keys (HERMES_API_KEY_<PROFILE>): the
+        # profile name maps into the env var name with `-` replaced by `_`
+        # and upper-cased (mgr-plattform -> HERMES_API_KEY_MGR_PLATTFORM).
+        # A profile without its own key falls back to HERMES_API_KEY.
+        profile_keys: dict[str, str] = {}
+        key_prefix = "HERMES_API_KEY_"
+        for env_name, value in e.items():
+            if not env_name.startswith(key_prefix):
+                continue
+            profile_name = env_name[len(key_prefix):].lower().replace("_", "-")
+            if not profile_name or not value.strip():
+                continue
+            if profile_name not in profile_routes:
+                raise ConfigError(
+                    f"{env_name} defines a key for profile {profile_name!r}, but that "
+                    "profile is not listed in HERMES_PROFILE_ROUTES"
+                )
+            profile_keys[profile_name] = value.strip()
+        for profile_name in profile_routes:
+            if profile_name not in profile_keys:
+                logging.getLogger(__name__).warning(
+                    "profile %r has no HERMES_API_KEY_%s; requests fall back to the "
+                    "base HERMES_API_KEY",
+                    profile_name,
+                    profile_name.upper().replace("-", "_"),
+                )
+
         log_level_raw = (e.get("LOG_LEVEL") or "INFO").upper()
         if log_level_raw not in _VALID_LOG_LEVELS:
             raise ConfigError(
@@ -206,12 +303,15 @@ class Config:
             hermes_api_key=hermes_api_key,
             hermes_model=hermes_model,
             hermes_request_timeout_seconds=request_timeout,
+            hermes_request_max_seconds=request_max,
             bind_host=bind_host,
             bind_port=port,
             allowed_hosts=allowed_hosts,
             allowed_redirect_uris=allowed_redirect_uris,
             mcp_bearer_token=mcp_bearer_token,
             log_level=log_level,
+            profile_routes=profile_routes,
+            profile_keys=profile_keys,
         )
 
 
